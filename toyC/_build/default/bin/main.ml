@@ -23,6 +23,7 @@ type ir_instr =
   | Ret                           (* 返回 *)
   | Store of reg * reg * int       (* 存储到内存 *)
   | Load of reg * reg * int        (* 从内存加载 *)
+  | Mv of reg * reg               (* 寄存器间移动 *)
 
 type ir_func = {
   name: string;
@@ -38,7 +39,8 @@ type codegen_state = {
   stack_size: int;
   loop_labels: (string * string) list;
   reg_cache: (string, reg) Hashtbl.t; (* 寄存器分配缓存 *)
-  const_values: (expr, reg) Hashtbl.t; (* 常量值缓存 *)
+  const_cache: (int, reg) Hashtbl.t;   (* 常量值缓存 *)
+  current_block: ir_instr list ref;    (* 当前基本块 *)
 }
 
 let initial_state = {
@@ -48,7 +50,8 @@ let initial_state = {
   stack_size = 0;
   loop_labels = [];
   reg_cache = Hashtbl.create 10;
-  const_values = Hashtbl.create 10;
+  const_cache = Hashtbl.create 10;
+  current_block = ref [];
 }
 
 (* ==================== 辅助函数 ==================== *)
@@ -74,15 +77,10 @@ let emit_imm_load reg n =
   if n >= -2048 && n <= 2047 then
     [Li (reg, n)]  (* 小立即数直接加载 *)
   else
-    (* 核心算法：正确处理负数边界情况 *)
-    let high = (n lsr 12) land 0xFFFFF in
-    let low = n land 0xFFF in
-    
-    (* 关键优化：自动调整高/低位确保低12位在合法范围内 *)
-    if low >= 0x800 then
-      [Lui (reg, (high + 1) land 0xFFFFF); Addi (reg, reg, low - 0x1000)]
-    else
-      [Lui (reg, high); Addi (reg, reg, low)]
+    (* 完全正确的算法：处理所有边界情况 *)
+    let high = (n asr 12) + (if (n land 0x800) <> 0 then 1 else 0) in
+    let low = n - (high lsl 12) in
+    [Lui (reg, high land 0xFFFFF); Addi (reg, reg, low)]
 
 (* ==================== 表达式值范围分析 ==================== *)
 type value_range = 
@@ -125,63 +123,67 @@ let rec expr_range expr env =
 (* ==================== AST到IR转换（最终优化版） ==================== *)
 let rec expr_to_ir state expr env =
   (* 尝试从常量缓存中获取 *)
-  match Hashtbl.find_opt state.const_values expr with
-  | Some reg -> (reg, [], state)
-  | None -> 
-      match expr with
-      | Num n -> 
+  match expr with
+  | Num n -> 
+      (try 
+         let reg = Hashtbl.find state.const_cache n in
+         (reg, [], state)
+       with Not_found ->
+         let (temp, state') = fresh_temp state in
+         let code = emit_imm_load temp n in
+         Hashtbl.add state'.const_cache n temp;
+         (temp, code, state'))
+  
+  | Var x -> 
+      (* 尝试从寄存器缓存中获取 *)
+      (try 
+         let reg = Hashtbl.find state.reg_cache x in
+         (reg, [], state)
+       with Not_found ->
+         let offset, state' = get_var_offset state x in
+         let (temp, state'') = fresh_temp state' in
+         let code = [Load (temp, RiscvReg "sp", offset)] in
+         Hashtbl.add state''.reg_cache x temp;
+         (temp, code, state''))
+  
+  | Binary (op, e1, e2) ->
+      (* 值范围分析 *)
+      let range = expr_range expr env in
+      
+      (* 基于范围分析进行优化 *)
+      match range with
+      | Constant n -> 
+          expr_to_ir state (Num n) env
+      | Bounded (min, max) when max - min < 2048 && min >= -2048 && max <= 2047 ->
+          (* 如果值范围在可预测的小范围内，使用临时寄存器 *)
           let (temp, state') = fresh_temp state in
-          (temp, emit_imm_load temp n, state')
+          let (_, e1_code, state'') = expr_to_ir state' e1 env in
+          let (_, e2_code, state''') = expr_to_ir state'' e2 env in
+          let op_str = match op with
+            | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
+            | Div -> "div" | Mod -> "rem" | Lt -> "slt"
+            | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
+            | Eq -> "seq" | Neq -> "sne" | And -> "and"
+            | Or -> "or" in
+          let code = e1_code @ e2_code @ [BinaryOp (op_str, temp, 
+              (match e1 with Num _ -> RiscvReg "t0" | _ -> Temp (state.temp_counter - 2)), 
+              (match e2 with Num _ -> RiscvReg "t1" | _ -> Temp (state.temp_counter - 1)))] in
+          (temp, code, state''')
       
-      | Var x -> 
-          (* 尝试从寄存器缓存中获取 *)
-          (match Hashtbl.find_opt state.reg_cache x with
-          | Some reg -> (reg, [], state)
-          | None ->
-              let offset, state' = get_var_offset state x in
-              let (temp, state'') = fresh_temp state' in
-              let code = [Load (temp, RiscvReg "sp", offset)] in
-              Hashtbl.add state''.reg_cache x temp;
-              (temp, code, state''))
-      
-      | Binary (op, e1, e2) ->
-          (* 值范围分析 *)
-          let range = expr_range expr env in
-          
-          (* 基于范围分析进行优化 *)
-          match range with
-          | Constant n -> 
-              expr_to_ir state (Num n) env
-          | Bounded (min, max) when max - min < 2048 && min >= -2048 && max <= 2047 ->
-              (* 如果值范围在可预测的小范围内，使用临时寄存器 *)
-              let (temp, state') = fresh_temp state in
-              let (_, e1_code, state'') = expr_to_ir state' e1 env in
-              let (_, e2_code, state''') = expr_to_ir state'' e2 env in
-              let op_str = match op with
-                | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
-                | Div -> "div" | Mod -> "rem" | Lt -> "slt"
-                | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
-                | Eq -> "seq" | Neq -> "sne" | And -> "and"
-                | Or -> "or" in
-              let code = e1_code @ e2_code @ [BinaryOp (op_str, temp, 
-                  (match e1 with Num _ -> RiscvReg "t0" | _ -> Temp (state.temp_counter - 2)), 
-                  (match e2 with Num _ -> RiscvReg "t1" | _ -> Temp (state.temp_counter - 1)))] in
-              (temp, code, state''')
-          
-          | _ ->
-              (* 通用情况 *)
-              let (e1_reg, e1_code, state') = expr_to_ir state e1 env in
-              let (e2_reg, e2_code, state'') = expr_to_ir state' e2 env in
-              let (temp, state''') = fresh_temp state'' in
-              let op_str = match op with
-                | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
-                | Div -> "div" | Mod -> "rem" | Lt -> "slt"
-                | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
-                | Eq -> "seq" | Neq -> "sne" | And -> "and"
-                | Or -> "or" in
-              (temp, e1_code @ e2_code @ [BinaryOp (op_str, temp, e1_reg, e2_reg)], state''')
-      
-      | _ -> failwith "Unsupported expression"
+      | _ ->
+          (* 通用情况 *)
+          let (e1_reg, e1_code, state') = expr_to_ir state e1 env in
+          let (e2_reg, e2_code, state'') = expr_to_ir state' e2 env in
+          let (temp, state''') = fresh_temp state'' in
+          let op_str = match op with
+            | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
+            | Div -> "div" | Mod -> "rem" | Lt -> "slt"
+            | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
+            | Eq -> "seq" | Neq -> "sne" | And -> "and"
+            | Or -> "or" in
+          (temp, e1_code @ e2_code @ [BinaryOp (op_str, temp, e1_reg, e2_reg)], state''')
+  
+  | _ -> failwith "Unsupported expression"
 
 (* ==================== 基本块优化 ==================== *)
 let optimize_basic_block (instrs: ir_instr list) =
@@ -331,10 +333,56 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   } in
   optimize_function result
 
-(* ==================== 其他保持不变的部分 ==================== *)
+(* ==================== 语义分析（保持不变） ==================== *)
+(* ... [语义分析代码保持不变] ... *)
 
-(* [语义分析、AST转字符串等代码保持不变，参考原代码] *)
+(* ==================== 输出函数 ==================== *)
+let string_of_reg = function
+  | RiscvReg s -> s
+  | Temp n -> "t" ^ string_of_int n
 
+let string_of_ir ir_func =
+  let buf = Buffer.create 256 in
+  Buffer.add_string buf (Printf.sprintf "Function: %s\n" ir_func.name);
+  Buffer.add_string buf "Params: ";
+  List.iter (fun p -> Buffer.add_string buf (p ^ " ")) ir_func.params;
+  Buffer.add_string buf "\nBody:\n";
+  List.iter (fun instr ->
+    let instr_str = match instr with
+      | Li (r, n) -> Printf.sprintf "  li %s, %d" (string_of_reg r) n
+      | Lui (r, imm) -> Printf.sprintf "  lui %s, %d" (string_of_reg r) imm
+      | Addi (rd, rs, imm) -> Printf.sprintf "  addi %s, %s, %d" (string_of_reg rd) (string_of_reg rs) imm
+      | Mv (rd, rs) -> Printf.sprintf "  mv %s, %s" (string_of_reg rd) (string_of_reg rs)
+      | BinaryOp (op, rd, rs1, rs2) ->
+          Printf.sprintf "  %s %s, %s, %s" op
+            (string_of_reg rd)
+            (string_of_reg rs1)
+            (string_of_reg rs2)
+      | Branch (cond, rs1, rs2, label) ->
+          Printf.sprintf "  %s %s, %s, %s" cond
+            (string_of_reg rs1)
+            (string_of_reg rs2)
+            label
+      | Jmp label -> Printf.sprintf "  j %s" label
+      | Label label -> label ^ ":"
+      | Call func -> Printf.sprintf "  call %s" func
+      | Ret -> "  ret"
+      | Store (rs, base, offset) ->
+          Printf.sprintf "  sd %s, %d(%s)"
+            (string_of_reg rs)
+            offset
+            (string_of_reg base)
+      | Load (rd, base, offset) ->
+          Printf.sprintf "  ld %s, %d(%s)"
+            (string_of_reg rd)
+            offset
+            (string_of_reg base)
+    in
+    Buffer.add_string buf (instr_str ^ "\n")
+  ) ir_func.body;
+  Buffer.contents buf
+
+(* ==================== 主函数 ==================== *)
 let () =
   let ch = open_in "test/04_while_break.tc" in
   let ast = parse_channel ch in
