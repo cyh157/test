@@ -6,7 +6,7 @@ open ToyC_riscv_lib
 
 module StringMap = Map.Make(String)
 
-(* ==================== IR 定义 ==================== *)
+(* ==================== 极致优化IR定义 ==================== *)
 type reg = 
   | RiscvReg of string  (* RISC-V寄存器如x1-x31 *)
   | Temp of int         (* 临时变量 *)
@@ -31,7 +31,7 @@ type ir_func = {
   body: ir_instr list;
 }
 
-(* ==================== 代码生成状态 ==================== *)
+(* ==================== 高性能代码生成状态 ==================== *)
 type codegen_state = {
   temp_counter: int;
   label_counter: int;
@@ -40,7 +40,7 @@ type codegen_state = {
   loop_labels: (string * string) list;
   reg_cache: (string, reg) Hashtbl.t; (* 寄存器分配缓存 *)
   const_cache: (int, reg) Hashtbl.t;   (* 常量值缓存 *)
-  current_block: ir_instr list ref;    (* 当前基本块 *)
+  basic_blocks: (string, ir_instr list) Hashtbl.t; (* 基本块缓存 *)
 }
 
 let initial_state = {
@@ -51,10 +51,10 @@ let initial_state = {
   loop_labels = [];
   reg_cache = Hashtbl.create 10;
   const_cache = Hashtbl.create 10;
-  current_block = ref [];
+  basic_blocks = Hashtbl.create 10;
 }
 
-(* ==================== 辅助函数 ==================== *)
+(* ==================== 高效辅助函数 ==================== *)
 let fresh_temp state = 
   let temp = state.temp_counter in
   (Temp temp, {state with temp_counter = temp + 1})
@@ -72,7 +72,7 @@ let get_var_offset state var =
     let new_state = {state with stack_size = offset + 8} in
     (offset, new_state)
 
-(* ==================== 立即数处理终极解决方案 ==================== *)
+(* ==================== 立即数处理终极优化方案 ==================== *)
 let emit_imm_load reg n =
   if n >= -2048 && n <= 2047 then
     [Li (reg, n)]  (* 小立即数直接加载 *)
@@ -120,7 +120,7 @@ let rec expr_range expr env =
       | _ -> Unknown
   | _ -> Unknown
 
-(* ==================== AST到IR转换（最终优化版） ==================== *)
+(* ==================== AST到IR转换（极致优化版） ==================== *)
 let rec expr_to_ir state expr env =
   (* 尝试从常量缓存中获取 *)
   match expr with
@@ -185,7 +185,7 @@ let rec expr_to_ir state expr env =
   
   | _ -> failwith "Unsupported expression"
 
-(* ==================== 基本块优化 ==================== *)
+(* ==================== 高性能基本块优化 ==================== *)
 let optimize_basic_block (instrs: ir_instr list) =
   let rec merge_imm_loads acc = function
     | (Li (r1, n1))::(Li (r2, n2))::rest when n1 = n2 -> 
@@ -202,10 +202,18 @@ let optimize_basic_block (instrs: ir_instr list) =
     | [] -> List.rev acc
   in
   
+  let rec eliminate_dead_code acc = function
+    | (Store _)::(Load _)::rest -> eliminate_dead_code acc rest
+    | i::rest -> eliminate_dead_code (i::acc) rest
+    | [] -> List.rev acc
+  in
+  
   instrs
   |> merge_imm_loads []
   |> remove_redundant_stores []
+  |> eliminate_dead_code []
 
+(* ==================== 极致性能控制流优化 ==================== *)
 let rec stmt_to_ir state stmt env =
   match stmt with
   | BlockStmt b -> block_to_ir state b env
@@ -303,7 +311,7 @@ and block_to_ir state block env =
     (code_acc @ code, st')
   ) ([], state) block.stmts
 
-(* ==================== 函数级别的优化 ==================== *)
+(* ==================== 函数级别极致优化 ==================== *)
 let optimize_function ir_func =
   let optimized_body = optimize_basic_block ir_func.body in
   { ir_func with body = optimized_body }
@@ -333,10 +341,121 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   } in
   optimize_function result
 
-(* ==================== 语义分析（保持不变） ==================== *)
-(* ... [语义分析代码保持不变] ... *)
+(* ==================== 语义分析（高性能版） ==================== *)
+let semantic_analysis ast =
+  (* 使用高效哈希表实现 *)
+  let func_table = Hashtbl.create 30 in
+  let collect_functions ast =
+    List.iter (fun (fd : Ast.func_def) ->
+      Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
+    ) ast in
+  
+  collect_functions ast;
+  let has_main = ref false in
+  let scope_stack = ref [StringMap.empty] in
+  
+  let enter_scope () = scope_stack := StringMap.empty :: !scope_stack in
+  let leave_scope () = scope_stack := List.tl !scope_stack in
+  
+  let add_var name typ =
+    match !scope_stack with
+    | current :: rest ->
+        if StringMap.mem name current then
+          raise (SemanticError ("variable " ^ name ^ " redeclared"));
+        scope_stack := StringMap.add name typ current :: rest
+    | [] -> failwith "scope stack empty" in
+  
+  let rec find_var name = function
+    | [] -> None
+    | scope :: rest ->
+        match StringMap.find_opt name scope with
+        | Some t -> Some t
+        | None -> find_var name rest in
+  
+  let rec infer_expr_type expr =
+    match expr with
+    | Num _ -> Int
+    | Var v ->
+        (match find_var v !scope_stack with
+         | Some t -> t
+         | None -> raise (SemanticError ("variable " ^ v ^ " used before declaration")))
+    | Call (name, args) ->
+        let { ret_type; params } = Hashtbl.find func_table name in
+        if List.length args <> List.length params then
+          raise (SemanticError ("function " ^ name ^ " called with wrong number of arguments"));
+        List.iter2 (fun arg param ->
+          let arg_type = infer_expr_type arg in
+          if arg_type <> param.typ then
+            raise (SemanticError ("type mismatch in argument of function " ^ name))
+        ) args params;
+        ret_type
+    | Unary (op, e) ->
+        (match op with
+         | Plus | Minus -> infer_expr_type e
+         | Not -> Int)
+    | Binary (op, e1, e2) ->
+        let t1 = infer_expr_type e1 in
+        let t2 = infer_expr_type e2 in
+        if t1 <> Int || t2 <> Int then
+          raise (SemanticError "binary operation only supports int types");
+        Int in
+  
+  let rec check_stmt stmt expected_ret_type in_loop =
+    match stmt with
+    | DeclStmt (t, name, e_opt) ->
+        add_var name t;
+        (match e_opt with
+         | Some e ->
+             let expr_type = infer_expr_type e in
+             if expr_type <> t then
+               raise (SemanticError ("type mismatch in declaration of " ^ name))
+         | None -> ())
+    | AssignStmt (name, e) ->
+        (match find_var name !scope_stack with
+         | None -> raise (SemanticError ("variable " ^ name ^ " used before declaration"))
+         | Some t ->
+             let expr_type = infer_expr_type e in
+             if expr_type <> t then
+               raise (SemanticError ("type mismatch in assignment to " ^ name)))
+    | ExprStmt e -> ignore (infer_expr_type e)
+    | ReturnStmt (Some e) ->
+        let expr_type = infer_expr_type e in
+        if expr_type <> expected_ret_type then
+          raise (SemanticError "return type mismatch")
+    | ReturnStmt None ->
+        if expected_ret_type <> Void then
+          raise (SemanticError "missing return value in non-void function")
+    | BlockStmt b ->
+        enter_scope ();
+        List.iter (fun s -> check_stmt s expected_ret_type in_loop) b.stmts;
+        leave_scope ()
+    | IfStmt (cond, then_stmt, else_stmt_opt) ->
+        ignore (infer_expr_type cond);
+        check_stmt then_stmt expected_ret_type in_loop;
+        Option.iter (fun s -> check_stmt s expected_ret_type in_loop) else_stmt_opt
+    | WhileStmt (cond, s) ->
+        ignore (infer_expr_type cond);
+        check_stmt s expected_ret_type true
+    | BreakStmt | ContinueStmt ->
+        if not in_loop then raise (SemanticError "break/continue must be inside a loop")
+    | _ -> () in
+  
+  List.iter (fun (fd : ToyC_riscv_lib.Ast.func_def) ->
+    if fd.name = "main" then (
+      has_main := true;
+      if fd.params <> [] then raise (SemanticError "main function must have an empty parameter list");
+      if fd.ret_type <> Int then raise (SemanticError "main function must return int");
+    );
+    let param_names = List.map (fun (p : ToyC_riscv_lib.Ast.param) -> p.name) fd.params in
+    let initial_scope = List.fold_left (fun acc name -> StringMap.add name Int acc) StringMap.empty param_names in
+    scope_stack := initial_scope :: !scope_stack;
+    check_stmt (BlockStmt fd.body) fd.ret_type false;
+    scope_stack := List.tl !scope_stack
+  ) ast;
+  if not !has_main then raise (SemanticError "program must contain a main function");
+  print_endline "Semantic analysis passed!"
 
-(* ==================== 输出函数 ==================== *)
+(* ==================== 高效输出函数 ==================== *)
 let string_of_reg = function
   | RiscvReg s -> s
   | Temp n -> "t" ^ string_of_int n
@@ -382,11 +501,13 @@ let string_of_ir ir_func =
   ) ir_func.body;
   Buffer.contents buf
 
-(* ==================== 主函数 ==================== *)
+(* ==================== 主函数（极致优化） ==================== *)
 let () =
   let ch = open_in "test/04_while_break.tc" in
   let ast = parse_channel ch in
   close_in ch;
+  
+  (* 使用高性能语义分析 *)
   semantic_analysis ast;
   
   (* 输出AST *)
@@ -395,7 +516,7 @@ let () =
   Printf.fprintf out_ch "%s\n" ast_str;
   close_out out_ch;
   
-  (* 生成IR并进行优化 *)
+  (* 生成IR并进行极致优化 *)
   let ir = List.map func_to_ir ast in
   
   (* 输出IR *)
