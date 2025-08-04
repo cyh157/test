@@ -1,0 +1,8 @@
+lib: [
+  "_build/install/default/lib/ToyC_riscv/META"
+  "_build/install/default/lib/ToyC_riscv/dune-package"
+  "_build/install/default/lib/ToyC_riscv/opam"
+]
+bin: [
+  "_build/install/default/bin/ToyC_riscv"
+]

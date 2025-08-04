@@ -1,0 +1,30 @@
+Function: main
+Params: 
+Body:
+  li t0, 0
+  sd t0, 0(sp)
+loop0:
+  ld t1, 0(sp)
+  li t2, 10
+  slt t3, t1, t2
+  beqz t3, zero, end1
+  ld t4, 0(sp)
+  li t5, 5
+  seq t6, t4, t5
+  bnez t6, zero, then2
+  j else3
+then2:
+  j end1
+  j merge4
+else3:
+merge4:
+  ld t7, 0(sp)
+  li t8, 1
+  add t9, t7, t8
+  sd t9, 0(sp)
+  j loop0
+end1:
+  ld t10, 0(sp)
+  mv a0, t10
+  ret
+

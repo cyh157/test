@@ -1,0 +1,3 @@
+int main() {
+Block(int x = 0;; while (<(x, 10)) Block(if (==(x, 5)) Block(break;); x = +(x, 1);); return x;)
+}

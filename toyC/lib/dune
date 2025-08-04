@@ -1,0 +1,7 @@
+(library
+ (name ToyC_riscv_lib)
+ (modules parser lexer ast))
+
+(ocamllex lexer)
+(menhir 
+ (modules parser))
