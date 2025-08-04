@@ -36,8 +36,8 @@ type codegen_state = {
   var_offset: (string, int) Hashtbl.t;
   stack_size: int;
   loop_labels: (string * string) list;
-  const_env: (reg, int) Hashtbl.t; (* 新增：常量环境 *)
-  copy_env: (reg, reg) Hashtbl.t;  (* 新增：复制传播环境 *)
+  const_env: (reg, int) Hashtbl.t;
+  copy_env: (reg, reg) Hashtbl.t;
 }
 
 let initial_state = {
@@ -46,8 +46,8 @@ let initial_state = {
   var_offset = Hashtbl.create 10;
   stack_size = 0;
   loop_labels = [];
-  const_env = Hashtbl.create 10; (* 初始化常量环境 *)
-  copy_env = Hashtbl.create 10;  (* 初始化复制环境 *)
+  const_env = Hashtbl.create 10;
+  copy_env = Hashtbl.create 10;
 }
 
 (* ==================== 优化后的辅助函数 ==================== *)
@@ -68,8 +68,8 @@ let get_var_offset state var =
     let new_state = {state with stack_size = offset + 8} in
     (offset, new_state)
 
-(* 常量折叠和传播优化 *)
-let optimize_const_folding state expr =
+(* 常量折叠优化 *)
+let optimize_const_folding expr =
   match expr with
   | Binary (Add, Num n1, Num n2) -> Some (Num (n1 + n2))
   | Binary (Sub, Num n1, Num n2) -> Some (Num (n1 - n2))
@@ -90,43 +90,55 @@ let optimize_const_folding state expr =
 (* 强度削弱优化 *)
 let optimize_strength_reduction expr =
   match expr with
-  | Binary (Mul, e, Num 2) -> Binary (ShiftL, e, Num 1)
-  | Binary (Mul, e, Num 4) -> Binary (ShiftL, e, Num 2)
-  | Binary (Div, e, Num 2) -> Binary (ShiftR, e, Num 1)
-  | Binary (Mul, e, Num n) when n > 0 && n land (n - 1) = 0 ->
+  | Binary (Mul, e, Num n) when n > 0 && n land (n - 1) = 0 -> (* 幂为2 *)
       let shift = int_of_float (log (float n) /. log 2. +. 0.5) in
       Binary (ShiftL, e, Num shift)
+  | Binary (Mul, e, Num n) when n = 3 -> 
+      Binary (Add, e, Binary (ShiftL, e, Num 1))
+  | Binary (Mul, e, Num n) when n = 5 -> 
+      Binary (Add, e, Binary (ShiftL, e, Num 2))
+  | Binary (Mul, e, Num n) when n = 9 -> 
+      Binary (Add, e, Binary (ShiftL, e, Num 3))
+  | Binary (Div, e, Num n) when n > 0 && n land (n - 1) = 0 ->
+      let shift = int_of_float (log (float n) /. log 2. +. 0.5) in
+      Binary (ShiftR, e, Num shift)
   | _ -> expr
 
-(* 公共子表达式消除 *)
-let optimize_cse state expr seen =
-  match expr with
-  | Binary (op, e1, e2) ->
-      let expr_str = Printf.sprintf "%s_%s" (string_of_expr e1) (string_of_expr e2) in
-      if Hashtbl.mem seen expr_str then
-        (Hashtbl.find seen expr_str, state)
-      else
-        (expr, {state with cse_env = Hashtbl.add seen expr_str expr})
-  | _ -> (expr, state)
-
-(* 表达式转换优化 *)
-let rec optimize_expr state expr =
-  let expr = optimize_strength_reduction expr in
-  match optimize_const_folding state expr with
-  | Some e -> e
-  | None -> expr
+(* 解决大立即数问题 *)
+let handle_large_immediate state reg n =
+  let code = ref [] in
+  if n >= -2048 && n <= 2047 then
+    code := [Li (reg, n)]
+  else (
+    (* 正确处理大负立即数 *)
+    let high_bits = (n asr 12) in  (* 使用算术右移处理负数 *)
+    let low_bits = n - (high_bits lsl 12) in
+    code := [
+      Li (reg, high_bits);
+      Li (Temp (state.temp_counter + 1), low_bits);
+      BinaryOp ("add", reg, reg, Temp (state.temp_counter + 1))
+    ]
+  );
+  (reg, !code, {state with temp_counter = state.temp_counter + 2})
 
 (* ==================== 优化后的表达式转换 ==================== *)
 let rec expr_to_ir state expr =
-  let expr = optimize_expr state expr in
+  (* 应用优化 *)
+  let expr = match optimize_const_folding expr with
+    | Some e -> e
+    | None -> expr
+  in
+  let expr = optimize_strength_reduction expr in
+  
   match expr with
   | Num n -> 
-      let (temp, state') = fresh_temp state in
-      (temp, [Li (temp, n)], state')
+      handle_large_immediate state (Temp state.temp_counter) n
+      
   | Var x -> 
       let offset, state' = get_var_offset state x in
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "sp", offset)], state'')
+  
   | Binary (op, e1, e2) ->
       let op_str = match op with
         | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
@@ -138,23 +150,28 @@ let rec expr_to_ir state expr =
       let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
       let (temp, state''') = fresh_temp state'' in
       (temp, e1_code @ e2_code @ [BinaryOp (op_str, temp, e1_reg, e2_reg)], state''')
+  
   | _ -> failwith "Unsupported expression"
 
 (* ==================== 优化后的语句转换 ==================== *)
 let rec stmt_to_ir state stmt =
   match stmt with
   | BlockStmt b -> block_to_ir state b
+  
   | DeclStmt (_, name, Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
+  
   | DeclStmt (_, name, None) ->
       let offset, state' = get_var_offset state name in
       ([], state')
+  
   | AssignStmt (name, expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
+  
   | IfStmt (cond, then_stmt, else_stmt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
       let (then_label, state'') = fresh_label state' "then" in
@@ -164,24 +181,30 @@ let rec stmt_to_ir state stmt =
       let (else_code, state'''''') = 
         match else_stmt with
         | Some s -> stmt_to_ir state''''' s
-        | None -> ([], state''''') in
-      (cond_code @ 
-       [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
-        Jmp else_label;
-        Label then_label] @
-       then_code @
-       [Jmp merge_label;
-        Label else_label] @
-       else_code @
-       [Label merge_label], state'''''')
+        | None -> ([], state''''') 
+      in
+      ( cond_code @ 
+        [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+         Jmp else_label;
+         Label then_label] @ 
+        then_code @ 
+        [Jmp merge_label;
+         Label else_label] @ 
+        else_code @ 
+        [Label merge_label], 
+        state'''''' )
+  
   | ReturnStmt (Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state')
+  
   | ReturnStmt None ->
       ([Ret], state)
+  
   | ExprStmt expr ->
       let (_, expr_code, state') = expr_to_ir state expr in
       (expr_code, state')
+  
   | WhileStmt (cond, body) ->
       let (loop_label, state') = fresh_label state "loop" in
       let (end_label, state'') = fresh_label state' "end" in
@@ -198,14 +221,17 @@ let rec stmt_to_ir state stmt =
         [Jmp loop_label;
          Label end_label],
         { state'''' with loop_labels = List.tl state''''.loop_labels } )
+  
   | BreakStmt ->
       (match state.loop_labels with
        | (end_label, _) :: _ -> ([Jmp end_label], state)
        | [] -> failwith "break statement outside loop")
+  
   | ContinueStmt ->
       (match state.loop_labels with
        | (_, loop_label) :: _ -> ([Jmp loop_label], state)
        | [] -> failwith "continue statement outside loop")
+  
   | EmptyStmt ->
       ([], state)
 
@@ -234,51 +260,83 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     body = body_code;
   }
 
-(* ==================== 死代码消除优化 ==================== *)
-let dead_code_elimination instrs =
-  let used = Hashtbl.create 30 in
-  let rec mark_used reg =
-    if not (Hashtbl.mem used reg) then begin
-      Hashtbl.add used reg true;
-      match reg with
-      | RiscvReg _ -> ()
-      | Temp _ -> ()
-    end
-  in
-  
-  List.iter (function
-    | Li (rd, _) -> mark_used rd
-    | Mv (rd, rs) -> mark_used rd; mark_used rs
-    | BinaryOp (_, rd, rs1, rs2) -> mark_used rd; mark_used rs1; mark_used rs2
-    | Branch (_, rs1, rs2, _) -> mark_used rs1; mark_used rs2
-    | Store (rs, base, _) -> mark_used rs; mark_used base
-    | Load (rd, base, _) -> mark_used rd; mark_used base
-    | _ -> ()
-  ) instrs;
-  
-  List.filter (function
-    | Li (rd, _) -> Hashtbl.mem used rd
-    | Mv (rd, _) -> Hashtbl.mem used rd
-    | BinaryOp (_, rd, _, _) -> Hashtbl.mem used rd
-    | Load (rd, _, _) -> Hashtbl.mem used rd
-    | _ -> true
-  ) instrs
-
 (* ==================== 主程序 ==================== *)
 let () =
   let ch = open_in "test/04_while_break.tc" in
-  let ast = parse_channel ch in
+  let lexbuf = Lexing.from_channel ch in
+  let ast = 
+    try ToyC_riscv_lib.Parser.prog ToyC_riscv_lib.Lexer.token lexbuf 
+    with e -> close_in ch; raise e
+  in
   close_in ch;
+  
   semantic_analysis ast;
   
   let ir = List.map func_to_ir ast in
-  let optimized_ir = List.map (fun f -> 
-    {f with body = dead_code_elimination f.body}
-  ) ir in
   
-  (* 输出优化后的RISC-V代码 *)
-  let out_ch = open_out "optimized_riscv.s" in
-  output_string out_ch (string_of_ir optimized_ir);
-  close_out out_ch;
+  (* 输出优化后的汇编 *)
+  let oc = open_out "optimized_riscv.s" in
+  List.iter (fun func ->
+    output_string oc (Printf.sprintf ".globl %s\n" func.name);
+    output_string oc (Printf.sprintf "%s:\n" func.name);
+    
+    List.iter (fun instr ->
+      let instr_str = match instr with
+        | Li (r, n) when n >= -2048 && n <= 2047 -> 
+            Printf.sprintf "  li %s, %d" 
+              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              n
+        | Li (r, n) -> (* 大立即数处理 *)
+            Printf.sprintf "  lui %s, %%hi(%d)\n  addi %s, %s, %%lo(%d)" 
+              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i) n
+              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i) 
+              n
+        | Mv (rd, rs) -> 
+            Printf.sprintf "  mv %s, %s" 
+              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        | BinaryOp (op, rd, rs1, rs2) -> 
+            Printf.sprintf "  %s %s, %s, %s" op
+              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match rs1 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match rs2 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        | Branch (cond, rs1, rs2, label) -> 
+            Printf.sprintf "  %s %s, %s, %s" cond
+              (match rs1 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match rs2 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              label
+        | Jmp label -> "  j " ^ label
+        | Label label -> label ^ ":"
+        | Call func -> "  call " ^ func
+        | Ret -> "  ret"
+        | Store (rs, base, off) when off >= -2048 && off <= 2047 -> 
+            Printf.sprintf "  sd %s, %d(%s)"
+              (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              off
+              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        | Store (rs, base, off) -> 
+            Printf.sprintf "  lui t0, %%hi(%d)\n  addi t0, t0, %%lo(%d)\n  add t0, %s, t0\n  sd %s, 0(t0)"
+              off off 
+              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        | Load (rd, base, off) when off >= -2048 && off <= 2047 -> 
+            Printf.sprintf "  ld %s, %d(%s)"
+              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              off
+              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        | Load (rd, base, off) -> 
+            Printf.sprintf "  lui t0, %%hi(%d)\n  addi t0, t0, %%lo(%d)\n  add t0, %s, t0\n  ld %s, 0(t0)"
+              off off 
+              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+      in
+      output_string oc (instr_str ^ "\n")
+    ) func.body;
+    
+    output_string oc "\n"
+  ) ir;
   
-  print_endline "Optimization complete!"
+  close_out oc;
+  
+  print_endline "Optimized assembly written to optimized_riscv.s"
