@@ -42,10 +42,11 @@ type codegen_state = {
   mutable loop_labels: (string * string) list;
   mutable current_code: ir_instr list;
   const_values: (int, reg) Hashtbl.t;
-  mutable copy_prop_map: (string, reg) Hashtbl.t; (* 复制传播映射 *)
-  mutable dead_code_elim: bool; (* 死代码消除标志 *)
-  mutable cse_cache: (expr * reg) list; (* 公共子表达式缓存 *)
-  mutable loop_invariants: (ir_instr list) list; (* 循环不变量 *)
+  mutable copy_prop_map: (string, reg) Hashtbl.t;
+  mutable dead_code_elim: bool;
+  mutable cse_cache: (expr * reg) list;
+  mutable loop_invariants: (ir_instr list) list;
+  mutable active_vars: StringSet.t;
 }
 
 let initial_state () = 
@@ -61,6 +62,7 @@ let initial_state () =
     dead_code_elim = false;
     cse_cache = [];
     loop_invariants = [];
+    active_vars = StringSet.empty;
   }
 
 (* ==================== 高效辅助函数 ==================== *)
@@ -93,18 +95,22 @@ let reduce_strength op e1 e2 =
   | Mul, _, Num n when n = 1 -> Some e1
   | Mul, Num n, _ when n = 0 -> Some (Num 0)
   | Mul, _, Num n when n = 0 -> Some (Num 0)
-  | Mul, Num 2, e | Mul, e, Num 2 -> Some (Binary (Add, e, e))
-  | Mul, Num n, e when n land (n - 1) = 0 -> (* n是2的幂 *)
+  | Mul, Num n, e when n > 0 && (n land (n - 1)) = 0 -> 
       let shift = Int.log2 n in
       Some (Binary (LShift, e, Num shift))
-  | Mul, e, Num n when n land (n - 1) = 0 -> 
+  | Mul, e, Num n when n > 0 && (n land (n - 1)) = 0 -> 
       let shift = Int.log2 n in
       Some (Binary (LShift, e, Num shift))
-  | Div, e, Num n when n land (n - 1) = 0 -> 
+  | Div, e, Num n when n > 0 && (n land (n - 1)) = 0 -> 
       let shift = Int.log2 n in
       Some (Binary (RShift, e, Num shift))
   | Add, e, Num 0 | Add, Num 0, e -> Some e
   | Sub, e, Num 0 -> Some e
+  | Sub, e1, e2 when e1 = e2 -> Some (Num 0)
+  | And, Num n1, Num n2 -> Some (Num (if n1 <> 0 && n2 <> 0 then 1 else 0))
+  | Or, Num n1, Num n2 -> Some (Num (if n1 <> 0 || n2 <> 0 then 1 else 0))
+  | Eq, e1, e2 when e1 = e2 -> Some (Num 1)
+  | Neq, e1, e2 when e1 = e2 -> Some (Num 0)
   | _ -> None
 
 (* ==================== 常量折叠 ==================== *)
@@ -159,11 +165,13 @@ let find_cse state expr =
 
 (* ==================== 立即数范围优化 ==================== *)
 let emit_imm_load state reg n =
-  if n >= -2048 && n <= 2047 then
+  if n = 0 then
+    emit state (Mv (reg, RiscvReg "x0"))
+  else if n >= -2048 && n <= 2047 then
     emit state (Li (reg, n))
   else 
     let high_bits = (n + 0x800) lsr 12 in
-    let low_bits = n - (high_bits lsl 12) in
+    let low_bits = n land 0xFFF in
     emit state (Lui (reg, high_bits));
     if low_bits <> 0 then
       emit state (Addi (reg, reg, low_bits))
@@ -180,31 +188,31 @@ let rec expr_to_ir state expr =
         (try Hashtbl.find state.const_values n
          with Not_found ->
            let temp = fresh_temp state in
-           if n = 0 then
-             emit state (Mv (temp, RiscvReg "x0"))
-           else
-             emit_imm_load state temp n;
+           emit_imm_load state temp n;
            Hashtbl.add state.const_values n temp;
            temp)
           
     | Var x ->
         (* 复制传播 *)
-        try Hashtbl.find state.copy_prop_map x
-        with Not_found ->
-          let offset = get_var_offset state x in
-          let temp = fresh_temp state in
-          if offset >= -2048 && offset <= 2047 then
-            emit state (Load (temp, RiscvReg "sp", offset))
-          else
-            let offset_reg = fresh_temp state in
-            emit_imm_load state offset_reg offset;
-            let addr_reg = fresh_temp state in
-            emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg));
-            emit state (Load (temp, addr_reg, 0));
-          temp
+        (try Hashtbl.find state.copy_prop_map x
+         with Not_found ->
+           (* 激活变量分析 *)
+           if not (StringSet.mem x state.active_vars) then
+             emit state (Mv (RiscvReg "x0", RiscvReg "x0")); (* 占位 *)
+           
+           let offset = get_var_offset state x in
+           let temp = fresh_temp state in
+           if offset >= -2048 && offset <= 2047 then
+             emit state (Load (temp, RiscvReg "sp", offset))
+           else
+             let offset_reg = fresh_temp state in
+             emit_imm_load state offset_reg offset;
+             let addr_reg = fresh_temp state in
+             emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg));
+             emit state (Load (temp, addr_reg, 0));
+           temp)
           
     | Binary (op, e1, e2) ->
-        (* 强度削弱 *)
         match reduce_strength op e1 e2 with
         | Some e -> expr_to_ir state e
         | None ->
@@ -233,17 +241,27 @@ let rec expr_to_ir state expr =
         emit state (BinaryOp ("seqz", temp, e_reg, RiscvReg "x0"));
         temp
         
+    | CallExpr (fname, args) ->
+        let arg_regs = List.map (expr_to_ir state) args in
+        List.iteri (fun i arg_reg ->
+          if i < 8 then
+            emit state (Mv (RiscvReg ("a" ^ string_of_int i), arg_reg))
+        ) arg_regs;
+        emit state (Call fname);
+        RiscvReg "a0"
+        
     | _ -> 
         RiscvReg "x0"
     in
-    (* 缓存公共子表达式 *)
     state.cse_cache <- (expr, result) :: state.cse_cache;
     result
 
-(* ==================== 死代码消除 ==================== *)
-let has_side_effects = function
-  | AssignStmt _ | DeclStmt (_, _, Some _) | CallExpr _ -> true
+(* ==================== 死代码消除辅助 ==================== *)
+let rec has_side_effects = function
+  | AssignStmt _ | DeclStmt (_, _, Some _) -> true
   | ReturnStmt _ | BreakStmt | ContinueStmt -> true
+  | CallExpr _ -> true
+  | Binary (Assign, _, _) -> true
   | _ -> false
 
 (* ==================== 循环不变量外提 ==================== *)
@@ -251,18 +269,24 @@ let extract_loop_invariants state body =
   let invariants = ref [] in
   let new_body = ref [] in
   
-  let is_invariant stmt =
+  let rec is_invariant stmt =
     match stmt with
-    | DeclStmt (_, _, Some expr) ->
-        not (contains_var expr state.loop_labels)
-    | AssignStmt (_, expr) ->
-        not (contains_var expr state.loop_labels)
+    | DeclStmt (_, name, Some expr) ->
+        state.active_vars <- StringSet.add name state.active_vars;
+        not (has_loop_dependent_vars expr)
+    | AssignStmt (name, expr) ->
+        state.active_vars <- StringSet.add name state.active_vars;
+        not (has_loop_dependent_vars expr)
     | ExprStmt expr ->
-        not (contains_var expr state.loop_labels)
+        not (has_loop_dependent_vars expr)
     | _ -> false
-  and contains_var expr labels =
-    (* 简化实现：检查是否包含循环变量 *)
-    false (* 实际实现需要变量分析 *)
+  and has_loop_dependent_vars expr =
+    match expr with
+    | Var x -> StringSet.mem x state.active_vars
+    | Binary (_, e1, e2) -> 
+        has_loop_dependent_vars e1 || has_loop_dependent_vars e2
+    | Unary (_, e) -> has_loop_dependent_vars e
+    | _ -> false
   in
   
   List.iter (fun stmt ->
@@ -277,14 +301,17 @@ let extract_loop_invariants state body =
 
 (* ==================== 优化的语句处理 ==================== *)
 let rec stmt_to_ir state stmt =
+  if state.dead_code_elim then () else
   match stmt with
   | BlockStmt b -> 
       let save_cse = state.cse_cache in
       let save_cp = Hashtbl.copy state.copy_prop_map in
+      let save_active = state.active_vars in
       List.iter (fun s -> stmt_to_ir state s) b.stmts;
       state.cse_cache <- save_cse;
       Hashtbl.clear state.copy_prop_map;
-      Hashtbl.iter (fun k v -> Hashtbl.add state.copy_prop_map k v) save_cp
+      Hashtbl.iter (fun k v -> Hashtbl.add state.copy_prop_map k v) save_cp;
+      state.active_vars <- save_active
   
   | DeclStmt (_, name, Some expr) ->
       let expr_reg = expr_to_ir state expr in
@@ -297,11 +324,13 @@ let rec stmt_to_ir state stmt =
         let addr_reg = fresh_temp state in
         emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg));
         emit state (Store (expr_reg, addr_reg, 0));
-      Hashtbl.add state.copy_prop_map name expr_reg
+      Hashtbl.add state.copy_prop_map name expr_reg;
+      state.active_vars <- StringSet.add name state.active_vars
   
   | DeclStmt (_, name, None) ->
       ignore (get_var_offset state name);
-      Hashtbl.add state.copy_prop_map name (RiscvReg "zero")
+      Hashtbl.add state.copy_prop_map name (RiscvReg "zero");
+      state.active_vars <- StringSet.add name state.active_vars
   
   | AssignStmt (name, expr) ->
       let expr_reg = expr_to_ir state expr in
@@ -317,7 +346,8 @@ let rec stmt_to_ir state stmt =
         let addr_reg = fresh_temp state in
         emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg));
         emit state (Store (expr_reg, addr_reg, 0));
-      Hashtbl.replace state.copy_prop_map name expr_reg
+      Hashtbl.replace state.copy_prop_map name expr_reg;
+      state.active_vars <- StringSet.add name state.active_vars
   
   | IfStmt (cond, then_stmt, else_stmt) ->
       let cond_expr = constant_folding cond in
@@ -332,13 +362,13 @@ let rec stmt_to_ir state stmt =
         
         emit state (Branch ("beqz", cond_reg, RiscvReg "zero", else_label));
         stmt_to_ir state then_stmt;
-        emit state (Jmp merge_label);
+        if not state.dead_code_elim then
+          emit state (Jmp merge_label);
         
         emit state (Label else_label);
         Option.iter (fun s -> stmt_to_ir state s) else_stmt;
         
         emit state (Label merge_label);
-        (* 清除复制传播映射，因为分支可能改变变量值 *)
         Hashtbl.clear state.copy_prop_map
   
   | ReturnStmt (Some expr) ->
@@ -372,7 +402,7 @@ let rec stmt_to_ir state stmt =
       state.loop_labels <- (end_label, cond_label) :: state.loop_labels;
       
       (* 生成循环不变量代码 *)
-      List.iter (fun inv_instr -> emit state inv_instr) invariant_body;
+      List.iter (fun inv_stmt -> stmt_to_ir state inv_stmt) invariant_body;
       
       emit state (Jmp cond_label);
       emit state (Label start_label);
@@ -380,16 +410,16 @@ let rec stmt_to_ir state stmt =
       
       emit state (Label cond_label);
       let cond_expr = constant_folding cond in
-      if cond_expr = Num 0 then (* 循环条件恒假 *)
-        ()
+      if cond_expr = Num 0 then
+        () (* 循环条件恒假，跳过循环体 *)
       else
         let cond_reg = expr_to_ir state cond in
         emit state (Branch ("bnez", cond_reg, RiscvReg "zero", start_label));
       
       emit state (Label end_label);
       state.loop_labels <- List.tl state.loop_labels;
-      (* 清除复制传播映射，因为循环可能改变变量值 *)
-      Hashtbl.clear state.copy_prop_map
+      Hashtbl.clear state.copy_prop_map;
+      state.active_vars <- StringSet.empty
   
   | BreakStmt ->
       (match state.loop_labels with
@@ -415,7 +445,8 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   List.iteri (fun i (p : Ast.param) ->
     let offset = i * 8 in
     Hashtbl.add state.var_offset p.name offset;
-    Hashtbl.add state.copy_prop_map p.name (RiscvReg (Printf.sprintf "a%d" i))
+    Hashtbl.add state.copy_prop_map p.name (RiscvReg (Printf.sprintf "a%d" i));
+    state.active_vars <- StringSet.add p.name state.active_vars;
   ) func.params;
   
   state.stack_size <- List.length func.params * 8;
@@ -432,11 +463,31 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     | instr :: rest -> remove_dead_code rest
   in
   
+  (* 基本块优化 *)
+  let optimize_blocks body =
+    let rec group_blocks acc current = function
+      | [] -> List.rev (current :: acc)
+      | Label s :: rest -> 
+          let new_acc = if current = [] then acc else current :: acc in
+          group_blocks new_acc [Label s] rest
+      | instr :: rest -> group_blocks acc (instr :: current) rest
+    in
+    
+    let blocks = group_blocks [] [] body in
+    
+    (* 移除空基本块 *)
+    List.filter (function
+      | [Label _] -> false
+      | _ -> true
+    ) blocks
+    |> List.flatten
+  in
+  
   let optimized_body = 
     state.current_code 
     |> List.rev 
     |> remove_dead_code
-    |> List.rev
+    |> optimize_blocks
   in
   
   (* 16字节栈对齐 *)
@@ -466,19 +517,10 @@ let string_of_reg = function
 
 let string_of_ir_instr = function
   | Li (r, n) -> 
-      if n >= -2048 && n <= 2047 then
-        Printf.sprintf "li %s, %d" (string_of_reg r) n
-      else
-        Printf.sprintf "# LARGE IMM: %d\n  lui %s, %d\n  addi %s, %s, %d" 
-          n (string_of_reg r) (n lsr 12) (string_of_reg r) (string_of_reg r) (n land 0xFFF)
-        
+      Printf.sprintf "li %s, %d" (string_of_reg r) n
   | Lui (r, n) -> Printf.sprintf "lui %s, %d" (string_of_reg r) n
-  | Addi (rd, rs1, imm) when imm >= -2048 && imm <= 2047 ->
-      Printf.sprintf "addi %s, %s, %d" (string_of_reg rd) (string_of_reg rs1) imm
   | Addi (rd, rs1, imm) ->
-      Printf.sprintf "# INVALID ADDI: %d\n  lui %s, %d\n  addi %s, %s, %d" 
-        imm (string_of_reg rd) (imm lsr 12) (string_of_reg rd) (string_of_reg rd) (imm land 0xFFF)
-        
+      Printf.sprintf "addi %s, %s, %d" (string_of_reg rd) (string_of_reg rs1) imm
   | BinaryOp (op, rd, rs1, rs2) -> 
       Printf.sprintf "%s %s, %s, %s" op (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
   | Branch (op, r1, r2, label) -> 
@@ -487,20 +529,10 @@ let string_of_ir_instr = function
   | Label s -> s ^ ":"
   | Call f -> "call " ^ f
   | Ret -> "ret"
-  | Store (r, base, off) when off >= -2048 && off <= 2047 ->
-      Printf.sprintf "sd %s, %d(%s)" (string_of_reg r) off (string_of_reg base)
   | Store (r, base, off) ->
-      let temp = "t" ^ string_of_int (off land 0xFFFF) in
-      Printf.sprintf "# LARGE OFFSET: %d\n  lui %s, %d\n  addi %s, %s, %d\n  sd %s, 0(%s)" 
-        off temp (off lsr 12) temp temp (off land 0xFFF) (string_of_reg r) temp
-        
-  | Load (r, base, off) when off >= -2048 && off <= 2047 ->
-      Printf.sprintf "ld %s, %d(%s)" (string_of_reg r) off (string_of_reg base)
+      Printf.sprintf "sd %s, %d(%s)" (string_of_reg r) off (string_of_reg base)
   | Load (r, base, off) ->
-      let temp = "t" ^ string_of_int (off land 0xFFFF) in
-      Printf.sprintf "# LARGE OFFSET: %d\n  lui %s, %d\n  addi %s, %s, %d\n  ld %s, 0(%s)" 
-        off temp (off lsr 12) temp temp (off land 0xFFF) (string_of_reg r) temp
-        
+      Printf.sprintf "ld %s, %d(%s)" (string_of_reg r) off (string_of_reg base)
   | Mv (rd, rs) -> Printf.sprintf "mv %s, %s" (string_of_reg rd) (string_of_reg rs)
 
 let string_of_ir_func f =
@@ -511,11 +543,21 @@ let string_of_ir_func f =
   if f.stack_size > 0 then
     Buffer.add_string buffer (Printf.sprintf "  addi sp, sp, -%d\n" f.stack_size);
   
+  (* 保存调用者保存的寄存器 *)
+  for i = 0 to 7 do
+    Buffer.add_string buffer (Printf.sprintf "  sd a%d, %d(sp)\n" i (i * 8));
+  done;
+  
   List.iter (fun instr ->
     Buffer.add_string buffer "  ";
     Buffer.add_string buffer (string_of_ir_instr instr);
     Buffer.add_char buffer '\n'
   ) f.body;
+  
+  (* 恢复调用者保存的寄存器 *)
+  for i = 0 to 7 do
+    Buffer.add_string buffer (Printf.sprintf "  ld a%d, %d(sp)\n" i (i * 8));
+  done;
   
   if f.stack_size > 0 then
     Buffer.add_string buffer (Printf.sprintf "  addi sp, sp, %d\n" f.stack_size);
@@ -542,12 +584,10 @@ let () =
   (* 输出IR *)
   let out_ch = open_out "risc-V.s" in
   List.iter (fun f ->
-    output_string out_ch (string_of_ir_instr (Label f.name));
-    output_string out_ch "\n";
     output_string out_ch (string_of_ir_func f);
     output_string out_ch "\n"
   ) ir;
   close_out out_ch;
   
   print_endline "Compilation successful!";
-  print_endline "Optimized RISC-V assembly written to risc-V.txt"
+  print_endline "Optimized RISC-V assembly written to risc-V.s"
