@@ -34,14 +34,14 @@ type ir_func = {
 
 (* ==================== 代码生成状态 ==================== *)
 type codegen_state = {
-  temp_counter: int;
-  label_counter: int;
+  mutable temp_counter: int;
+  mutable label_counter: int;
   mutable var_offset: (string, int) Hashtbl.t; (* Mutable for efficiency *)
   mutable stack_size: int;                     (* Mutable for efficiency *)
-  loop_labels: (string * string) list;
+  mutable loop_labels: (string * string) list; (* Mutable for efficiency *)
   mutable reg_cache: (string, reg) Hashtbl.t;  (* Mutable for efficiency *)
   mutable const_values: (expr, reg) Hashtbl.t; (* Mutable for efficiency *)
-  mutable current_code: ir_instr list;         (* Accumulate code incrementally *)
+  mutable current_code: ir_instr list;         (* Accumulate code incrementally (in reverse order) *)
 }
 
 let initial_state = {
@@ -75,22 +75,25 @@ let get_var_offset state var =
     state.stack_size <- offset + 8; (* Assuming 8 bytes per variable *)
     offset
 
+(* 优化：使用 cons 操作符在列表头部添加，最后反转 *)
 let emit state instr =
-  state.current_code <- state.current_code @ [instr]
+  state.current_code <- instr :: state.current_code
 
 let emit_many state instrs =
-  state.current_code <- state.current_code @ instrs
+  state.current_code <- (List.rev instrs) @ state.current_code
 
 (* ==================== 立即数处理终极解决方案 ==================== *)
 let emit_imm_load state reg n =
   if n >= -2048 && n <= 2047 then
     emit state (Li (reg, n))
   else
-    let high = (n lsr 12) land 0xFFFFF in
+    (* RISC-V的LUI加载高20位，ADDImm加载低12位，ADDImm有符号扩展。
+       因此，如果低12位是负数，我们需要对高20位进行调整。 *)
+    let high = (n lsr 12) in
     let low = n land 0xFFF in
-    if low >= 0x800 then begin
-      emit state (Lui (reg, (high + 1) land 0xFFFFF));
-      emit state (Addi (reg, reg, low - 0x1000));
+    if low >= 0x800 then begin (* 如果低12位表示的是负数，例如 0xFFF = -1 *)
+      emit state (Lui (reg, high + 1));
+      emit state (Addi (reg, reg, low - 0x1000)); (* 将低12位调整为负数 *)
     end else begin
       emit state (Lui (reg, high));
       emit state (Addi (reg, reg, low));
@@ -154,7 +157,16 @@ let rec expr_to_ir state expr env =
           | None ->
               let offset = get_var_offset state x in
               let temp = fresh_temp state in
-              emit state (Load (temp, RiscvReg "sp", offset));
+              (* 如果偏移量超出 addi 的立即数范围，需要多条指令来计算地址 *)
+              if offset >= -2048 && offset <= 2047 then begin
+                emit state (Load (temp, RiscvReg "sp", offset))
+              end else begin
+                let offset_reg = fresh_temp state in
+                emit_imm_load state offset_reg offset; (* 加载完整的偏移量 *)
+                let addr_reg = fresh_temp state in
+                emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg)); (* sp + offset_reg *)
+                emit state (Load (temp, addr_reg, 0)); (* 从计算出的地址加载，偏移量为0 *)
+              end;
               Hashtbl.add state.reg_cache x temp;
               temp)
 
@@ -228,8 +240,16 @@ let rec stmt_to_ir state stmt env =
   | DeclStmt (_, name, Some expr) ->
       let expr_reg = expr_to_ir state expr env in
       let offset = get_var_offset state name in
-      emit state (Store (expr_reg, RiscvReg "sp", offset));
-      (* Optimization: No need to call optimize_basic_block here, do it at function level *)
+      (* 如果偏移量超出 addi 的立即数范围，需要多条指令来计算地址 *)
+      if offset >= -2048 && offset <= 2047 then begin
+        emit state (Store (expr_reg, RiscvReg "sp", offset))
+      end else begin
+        let offset_reg = fresh_temp state in
+        emit_imm_load state offset_reg offset; (* 加载完整的偏移量 *)
+        let addr_reg = fresh_temp state in
+        emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg)); (* sp + offset_reg *)
+        emit state (Store (expr_reg, addr_reg, 0)); (* 存储到计算出的地址，偏移量为0 *)
+      end
 
   | DeclStmt (_, name, None) ->
       let _ = get_var_offset state name in (* Just ensure offset is allocated *)
@@ -238,8 +258,16 @@ let rec stmt_to_ir state stmt env =
   | AssignStmt (name, expr) ->
       let expr_reg = expr_to_ir state expr env in
       let offset = get_var_offset state name in
-      emit state (Store (expr_reg, RiscvReg "sp", offset));
-      (* Optimization: No need to call optimize_basic_block here, do it at function level *)
+      (* 如果偏移量超出 addi 的立即数范围，需要多条指令来计算地址 *)
+      if offset >= -2048 && offset <= 2047 then begin
+        emit state (Store (expr_reg, RiscvReg "sp", offset))
+      end else begin
+        let offset_reg = fresh_temp state in
+        emit_imm_load state offset_reg offset; (* 加载完整的偏移量 *)
+        let addr_reg = fresh_temp state in
+        emit state (BinaryOp ("add", addr_reg, RiscvReg "sp", offset_reg)); (* sp + offset_reg *)
+        emit state (Store (expr_reg, addr_reg, 0)); (* 存储到计算出的地址，偏移量为0 *)
+      end
 
   | IfStmt (cond, then_stmt, else_stmt) ->
       let cond_reg = expr_to_ir state cond env in
@@ -300,7 +328,6 @@ let rec stmt_to_ir state stmt env =
       ()
 
 and block_to_ir state block env =
-  (* Each block gets its own copy of the environment, but the state is mutable and shared *)
   let new_env = Hashtbl.copy env in
   List.iter (fun stmt -> stmt_to_ir state stmt new_env) block.stmts
 
@@ -319,30 +346,31 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     label_counter = 0; (* Reset for each function *)
     stack_size = 0; (* Reset for each function *)
     current_code = []; (* Reset for each function *)
+    loop_labels = []; (* Reset for each function *)
   } in
   let env = Hashtbl.create 10 in
 
   (* Add parameters to environment and allocate stack space *)
   List.iteri (fun i (p : Ast.param) ->
     Hashtbl.add env p.name (Bounded (-2147483648, 2147483647));
-    (* RISC-V convention: first 8 arguments in a0-a7 *)
-    if i < 8 then begin
-      let offset = get_var_offset state p.name in (* Still need stack space for spills/local vars *)
-      (* For initial param setup, we might copy from a0-a7 to stack or a temp reg *)
-      (* For simplicity here, we assume they are initially on stack through var_offset.
-         A full register allocator would handle actual parameter passing. *)
-    end else begin
-      let offset = get_var_offset state p.name in
-      ()
-    end
+    (* Call get_var_offset to ensure stack space is allocated for parameters *)
+    let _ = get_var_offset state p.name in
+    ()
   ) func.params;
 
   block_to_ir state func.body env;
+
+  (* 确保栈大小是 16 字节对齐 *)
+  let aligned_stack_size =
+    let align = 16 in
+    ((state.stack_size + align - 1) / align) * align
+  in
+
   let result = {
     name = func.name;
     params = List.map (fun (p : Ast.param) -> p.name) func.params;
-    body = state.current_code; (* Get the accumulated code *)
-    stack_size = state.stack_size; (* Get the final stack size *)
+    body = List.rev state.current_code; (* 反转列表以获得正确的指令顺序 *)
+    stack_size = aligned_stack_size; (* Get the final aligned stack size *)
   } in
   optimize_function result
 
@@ -372,7 +400,7 @@ let string_of_ir_func f =
   (* Adjust stack pointer only if stack_size is positive *)
   let prologue = if f.stack_size > 0 then Printf.sprintf "  addi sp, sp, -%d" f.stack_size else "" in
   let epilogue = if f.stack_size > 0 then Printf.sprintf "  addi sp, sp, %d" f.stack_size else "" in
-  Printf.sprintf ".global %s\n%s:\n%s\n  %s\n%s"
+  Printf.sprintf ".global %s\n%s:\n%s\n%s\n%s"
     f.name f.name prologue body_str epilogue
 
 
