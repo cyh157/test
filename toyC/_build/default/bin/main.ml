@@ -12,6 +12,7 @@ type reg =
   | Temp of int         (* 临时变量 *)
 
 type ir_instr =
+  | Lui of reg * int             (* 加载高20位 *)  (* 新增指令 *)
   | Li of reg * int                (* 加载立即数 *)
   | Mv of reg * reg                (* 寄存器间移动 *)
   | BinaryOp of string * reg * reg * reg (* 二元运算 *)
@@ -55,14 +56,21 @@ let fresh_label state prefix =
   let label = Printf.sprintf "%s%d" prefix state.label_counter in
   (label, {state with label_counter = state.label_counter + 1})
 
+(* 确保偏移量在2047范围内 *)
+let clamp_offset x = 
+  if x >= -2048 && x <= 2047 then x
+  else if x > 0 then 2047 
+  else -2048
+
+(* 修改：检查并限制偏移范围 *)
 let get_var_offset state var =
   try 
-    (Hashtbl.find state.var_offset var, state)  (* 找到时返回偏移量和原状态 *)
+    (clamp_offset (Hashtbl.find state.var_offset var), state)
   with Not_found -> 
     let offset = state.stack_size in
     Hashtbl.add state.var_offset var offset;
     let new_state = {state with stack_size = offset + 8} in
-    (offset, new_state)  (* 未找到时返回新偏移量和更新后的状态 *)
+    (clamp_offset offset, new_state)
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -284,6 +292,7 @@ let rec expr_to_ir state expr =
   match expr with
   | Num n -> 
       let (temp, state') = fresh_temp state in
+      (* 小立即数用Li，大立即数将用Lui+Li组合 *)
       (temp, [Li (temp, n)], state')
   | Var x -> 
       let offset, state' = get_var_offset state x in
@@ -407,6 +416,13 @@ let () =
   close_out out_ch;
    let ir = List.map func_to_ir ast in  (* 转换整个AST为IR *)
   
+  (* 新增：统一寄存器字符串转换 *)
+  let string_of_reg r = 
+    match r with 
+    | RiscvReg s -> s 
+    | Temp n -> "t" ^ string_of_int n
+  in
+
   let string_of_ir ir_func =
     let buf = Buffer.create 256 in
     Buffer.add_string buf (Printf.sprintf "Function: %s\n" ir_func.name);
@@ -415,42 +431,46 @@ let () =
     Buffer.add_string buf "\nBody:\n";
     List.iter (fun instr ->
       let instr_str = match instr with
-        | Li (r, n) -> Printf.sprintf "  li %s, %d" 
-                        (match r with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n) 
-                        n
-        | Mv (rd, rs) -> Printf.sprintf "  mv %s, %s" 
-                          (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-                          (match rs with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+        | Lui (r, n) -> (* 处理lui指令 *)
+            Printf.sprintf "  lui %s, %%hi(%d)" (string_of_reg r) n
+        | Li (r, n) -> 
+            if n >= -2048 && n <= 2047 then
+              Printf.sprintf "  li %s, %d" (string_of_reg r) n
+            else 
+              Printf.sprintf "  addi %s, zero, %%lo(%d)" (string_of_reg r) n
+        | Mv (rd, rs) -> 
+            Printf.sprintf "  mv %s, %s" (string_of_reg rd) (string_of_reg rs)
         | BinaryOp (op, rd, rs1, rs2) ->
             Printf.sprintf "  %s %s, %s, %s" op
-              (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              (match rs1 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              (match rs2 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (string_of_reg rd)
+              (string_of_reg rs1)
+              (string_of_reg rs2)
         | Branch (cond, rs1, rs2, label) ->
             Printf.sprintf "  %s %s, %s, %s" cond
-              (match rs1 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              (match rs2 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (string_of_reg rs1)
+              (string_of_reg rs2)
               label
-        | Jmp label ->
-            Printf.sprintf "  j %s" label
-        | Label label ->
-            label ^ ":"
-        | Call func ->
-            Printf.sprintf "  call %s" func
-        | Ret ->
-            "  ret"
+        | Jmp label -> "  j " ^ label
+        | Label label -> label ^ ":"
+        | Call func -> "  call " ^ func
+        | Ret -> "  ret"
         | Store (rs, base, offset) ->
             Printf.sprintf "  sd %s, %d(%s)"
-              (match rs with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (string_of_reg rs)
               offset
-              (match base with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (string_of_reg base)
         | Load (rd, base, offset) ->
             Printf.sprintf "  ld %s, %d(%s)"
-              (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (string_of_reg rd)
               offset
-              (match base with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (string_of_reg base)
       in
-      Buffer.add_string buf (instr_str ^ "\n")
+      Buffer.add_string buf (instr_str ^ "\n");
+      (* 为Li增加lui补充 *)
+      match instr with
+      | Li (r, n) when n < -2048 || n > 2047 -> 
+          Buffer.add_string buf (Printf.sprintf "  lui %s, %%hi(%d)\n" (string_of_reg r) n)
+      | _ -> ()
     ) ir_func.body;
     Buffer.contents buf
   in
