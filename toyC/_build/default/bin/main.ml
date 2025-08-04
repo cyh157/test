@@ -4,7 +4,57 @@ exception SemanticError of string
 open ToyC_riscv_lib.Ast
 open ToyC_riscv_lib
 
-module StringMap = Map.Make(String)
+(* 使用更轻量级的Hashtbl替代方案 *)
+module FastMap = struct
+  type 'a t = {
+    keys: string array;
+    values: 'a array;
+    mutable size: int;
+  }
+  
+  let create capacity = {
+    keys = Array.make capacity "";
+    values = Array.make capacity (Obj.magic 0);
+    size = 0;
+  }
+  
+  let find map key =
+    let rec loop i =
+      if i >= map.size then None
+      else if map.keys.(i) = key then Some map.values.(i)
+      else loop (i + 1)
+    in
+    loop 0
+  
+  let add map key value =
+    if map.size >= Array.length map.keys then
+      (* 需要扩容时创建新数组 *)
+      let new_cap = (Array.length map.keys * 2) in
+      let new_keys = Array.make new_cap "" in
+      let new_values = Array.make new_cap (Obj.magic 0) in
+      Array.blit map.keys 0 new_keys 0 map.size;
+      Array.blit map.values 0 new_values 0 map.size;
+      new_keys.(map.size) <- key;
+      new_values.(map.size) <- value;
+      { keys = new_keys; values = new_values; size = map.size + 1 }
+    else (
+      map.keys.(map.size) <- key;
+      map.values.(map.size) <- value;
+      map.size <- map.size + 1;
+      map
+    )
+  
+  let replace map key value =
+    let rec loop i =
+      if i >= map.size then add map key value
+      else if map.keys.(i) = key then (
+        map.values.(i) <- value;
+        map
+      )
+      else loop (i + 1)
+    in
+    loop 0
+end
 
 (* ==================== 优化的IR定义 ==================== *)
 type reg =
@@ -33,240 +83,269 @@ type ir_func = {
 }
 
 (* ==================== 高性能代码生成状态 ==================== *)
-type value_range =
-  | Unknown
-  | Constant of int
-  | Bounded of int * int
-
-type env_frame = {
-  vr_map: (string, value_range) Hashtbl.t;
-  next_frame: env_frame option;
-}
-
 type codegen_state = {
-  temp_counter: int ref;
-  label_counter: int ref;
-  var_offset: (string, int) Hashtbl.t;
-  stack_size: int ref;
-  loop_labels: (string * string) list ref;
-  const_values: (expr, reg) Hashtbl.t;
-  current_code: ir_instr list ref;
-  current_frame: env_frame ref;
+  temp_counter: int;
+  label_counter: int;
+  var_offset: (string, int) FastMap.t;
+  stack_size: int;
+  loop_labels: (string * string) list;
+  current_code: ir_instr list;
+  (* 使用数组存储常量表达式 *)
+  const_cache: (expr * reg) array ref;
+  const_cache_size: int ref;
 }
-
-(* ==================== 高效辅助函数 ==================== *)
-let create_frame parent = {
-  vr_map = Hashtbl.create 8;
-  next_frame = parent;
-}
-
-let rec lookup_var frame name =
-  try Hashtbl.find frame.vr_map name
-  with Not_found ->
-    match frame.next_frame with
-    | Some parent -> lookup_var parent name
-    | None -> Unknown
 
 let initial_state () = 
-  let root_frame = create_frame None in
   {
-    temp_counter = ref 0;
-    label_counter = ref 0;
-    var_offset = Hashtbl.create 16;
-    stack_size = ref 0;
-    loop_labels = ref [];
-    const_values = Hashtbl.create 16;
-    current_code = ref [];
-    current_frame = ref root_frame;
+    temp_counter = 0;
+    label_counter = 0;
+    var_offset = FastMap.create 16;
+    stack_size = 0;
+    loop_labels = [];
+    current_code = [];
+    const_cache = ref [||];
+    const_cache_size = ref 0;
   }
 
+(* ==================== 高效辅助函数 ==================== *)
 let fresh_temp state =
-  let counter = !(state.temp_counter) in
-  state.temp_counter := counter + 1;
-  Temp counter
+  ({ state with temp_counter = state.temp_counter + 1 }, 
+   Temp state.temp_counter)
 
 let fresh_label state prefix =
-  let counter = !(state.label_counter) in
-  state.label_counter := counter + 1;
-  Printf.sprintf "%s%d" prefix counter
+  ({ state with label_counter = state.label_counter + 1 },
+   Printf.sprintf "%s%d" prefix state.label_counter)
 
 let get_var_offset state var =
-  try Hashtbl.find state.var_offset var
-  with Not_found ->
-    (* 直接对齐到8字节边界 *)
-    let offset = (!(state.stack_size) + 7) land (lnot 7) in
-    state.stack_size := offset + 8;
-    Hashtbl.replace state.var_offset var offset;
-    offset
+  match FastMap.find state.var_offset var with
+  | Some offset -> (state, offset)
+  | None ->
+      (* 直接对齐到8字节边界 *)
+      let offset = (state.stack_size + 7) land (lnot 7) in
+      let new_state = {
+        state with 
+        stack_size = offset + 8;
+        var_offset = FastMap.add state.var_offset var offset
+      } in
+      (new_state, offset)
 
-let emit state instr =
-  state.current_code := instr :: !(state.current_code)
+(* 使用尾递归优化指令生成 *)
+let rec emit_imm_load state reg n =
+  if n = 0 then
+    let state' = { state with current_code = Mv (reg, RiscvReg "x0") :: state.current_code } in
+    state'
+  else if n >= -2048 && n <= 2047 then
+    { state with current_code = Li (reg, n) :: state.current_code }
+  else
+    let low12 = n land 0xFFF in
+    let adjusted_low = 
+      if low12 >= 0x800 then low12 - 0x1000 
+      else low12 in
+    let high20 = (n - adjusted_low) lsr 12 in
+    let state' = { 
+      state with 
+      current_code = Lui (reg, high20) :: state.current_code 
+    } in
+    if adjusted_low <> 0 then
+      { state' with current_code = Addi (reg, reg, adjusted_low) :: state'.current_code }
+    else state'
 
-(* 高效立即数处理 *)
-let emit_imm_load state reg n =
-  match n with
-  | 0 -> emit state (Mv (reg, RiscvReg "x0"))
-  | _ when n >= -2048 && n <= 2047 -> emit state (Li (reg, n))
-  | _ -> 
-      let low12 = n land 0xFFF in
-      let adjusted_low = 
-        if low12 >= 0x800 then low12 - 0x1000 
-        else low12 in
-      let high20 = (n - adjusted_low) lsr 12 in
-      emit state (Lui (reg, high20));
-      if adjusted_low <> 0 then
-        emit state (Addi (reg, reg, adjusted_low))
+let emit state instr = 
+  { state with current_code = instr :: state.current_code }
 
 (* ==================== 优化的AST到IR转换 ==================== *)
 let rec expr_to_ir state expr =
-  match Hashtbl.find_opt state.const_values expr with
-  | Some reg -> reg
+  (* 优化常量表达式查找 *)
+  let rec find_in_cache expr cache i =
+    if i >= Array.length cache then None
+    else 
+      let (e, r) = cache.(i) in
+      if e = expr then Some r
+      else find_in_cache expr cache (i + 1)
+  in
+  
+  match find_in_cache expr !(state.const_cache) 0 with
+  | Some reg -> (state, reg)
   | None ->
       match expr with
       | Num n ->
-          let temp = fresh_temp state in
-          if n = 0 then
-            emit state (Mv (temp, RiscvReg "x0"))
-          else
-            emit_imm_load state temp n;
-          Hashtbl.add state.const_values expr temp;
-          temp
+          let (state', temp) = fresh_temp state in
+          let state'' = emit_imm_load state' temp n in
+          (* 更新缓存 *)
+          if !(state.const_cache_size) >= Array.length !(state.const_cache) then
+            let new_size = max 4 (!(state.const_cache_size) * 2) in
+            let new_cache = Array.make new_size (Num 0, Temp 0) in
+            Array.blit !(state.const_cache) 0 new_cache 0 !(state.const_cache_size);
+            state.const_cache := new_cache;
+            new_cache.(!(state.const_cache_size)) <- (expr, temp);
+            state.const_cache_size := !(state.const_cache_size) + 1;
+            (state'', temp)
+          else (
+            !(state.const_cache).(!(state.const_cache_size)) <- (expr, temp);
+            state.const_cache_size := !(state.const_cache_size) + 1;
+            (state'', temp)
+          )
 
       | Var x ->
-          let offset = get_var_offset state x in
-          let temp = fresh_temp state in
-          emit state (Load (temp, RiscvReg "sp", offset));
-          temp
+          let (state', offset) = get_var_offset state x in
+          let (state'', temp) = fresh_temp state' in
+          let state''' = { 
+            state'' with 
+            current_code = Load (temp, RiscvReg "sp", offset) :: state''.current_code 
+          } in
+          (state''', temp)
 
       | Binary (op, e1, e2) ->
-          let e1_reg = expr_to_ir state e1 in
-          let e2_reg = expr_to_ir state e2 in
-          let temp = fresh_temp state in
+          let (state', e1_reg) = expr_to_ir state e1 in
+          let (state'', e2_reg) = expr_to_ir state' e2 in
+          let (state''', temp) = fresh_temp state'' in
           let op_str = match op with
             | Add -> "add" | Sub -> "sub" | Mul -> "mul"
             | Div -> "div" | Mod -> "rem" | Lt -> "slt"
             | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
             | Eq -> "seq" | Neq -> "sne" | And -> "and"
-            | Or -> "or" | _ -> failwith "Unsupported operator" in
-          emit state (BinaryOp (op_str, temp, e1_reg, e2_reg));
-          temp
+            | Or -> "or" | _ -> failwith "Unsupported operator" 
+          in
+          let state'''' = { 
+            state''' with 
+            current_code = BinaryOp (op_str, temp, e1_reg, e2_reg) :: state'''.current_code 
+          } in
+          (state'''', temp)
 
       | _ -> failwith "Unsupported expression"
 
+(* 优化控制流：减少标签数量 *)
 let rec stmt_to_ir state stmt =
   match stmt with
-  | BlockStmt b -> block_to_ir state b
+  | BlockStmt b -> block_to_ir state b.stmts
 
   | DeclStmt (_, name, Some expr) ->
-      let expr_reg = expr_to_ir state expr in
-      let offset = get_var_offset state name in
-      emit state (Store (expr_reg, RiscvReg "sp", offset))
+      let (state', expr_reg) = expr_to_ir state expr in
+      let (state'', offset) = get_var_offset state' name in
+      let state''' = { 
+        state'' with 
+        current_code = Store (expr_reg, RiscvReg "sp", offset) :: state''.current_code 
+      } in
+      state'''
 
   | DeclStmt (_, name, None) ->
-      (* 仅分配空间，不生成代码 *)
-      ignore (get_var_offset state name)
+      let (state', _) = get_var_offset state name in
+      state'
 
   | AssignStmt (name, expr) ->
-      let expr_reg = expr_to_ir state expr in
+      let (state', expr_reg) = expr_to_ir state expr in
       let offset = 
-        try Hashtbl.find state.var_offset name 
-        with Not_found -> get_var_offset state name in
-      emit state (Store (expr_reg, RiscvReg "sp", offset))
+        match FastMap.find state.var_offset name with
+        | Some off -> off
+        | None -> 
+            (* 变量尚未声明，分配新位置 *)
+            let (state'', off) = get_var_offset state' name in
+            off
+      in
+      let state''' = { 
+        state' with 
+        current_code = Store (expr_reg, RiscvReg "sp", offset) :: state'.current_code 
+      } in
+      state'''
 
   | IfStmt (cond, then_stmt, else_stmt) ->
-      let cond_reg = expr_to_ir state cond in
-      let else_label = fresh_label state "else" in
-      let merge_label = fresh_label state "merge" in
-
-      emit state (Branch ("beqz", cond_reg, RiscvReg "zero", else_label));
-      stmt_to_ir state then_stmt;
-      emit state (Jmp merge_label);
-      
-      emit state (Label else_label);
-      (match else_stmt with
-      | Some s -> stmt_to_ir state s
-      | None -> ());
-      
-      emit state (Label merge_label)
+      let (state', cond_reg) = expr_to_ir state cond in
+      let (state'', else_label) = fresh_label state' "else" in
+      let (state''', merge_label) = fresh_label state'' "merge" in
+      let state4 = { 
+        state''' with 
+        current_code = Branch ("beqz", cond_reg, RiscvReg "zero", else_label) :: state'''.current_code 
+      } in
+      let state5 = stmt_to_ir state4 then_stmt in
+      let state6 = { 
+        state5 with 
+        current_code = Jmp merge_label :: Label else_label :: state5.current_code 
+      } in
+      let state7 = match else_stmt with
+        | Some s -> stmt_to_ir state6 s
+        | None -> state6
+      in
+      { state7 with current_code = Label merge_label :: state7.current_code }
 
   | ReturnStmt (Some expr) ->
-      let expr_reg = expr_to_ir state expr in
-      emit state (Mv (RiscvReg "a0", expr_reg));
-      emit state Ret
+      let (state', expr_reg) = expr_to_ir state expr in
+      let state'' = { 
+        state' with 
+        current_code = Mv (RiscvReg "a0", expr_reg) :: state'.current_code 
+      } in
+      { state'' with current_code = Ret :: state''.current_code }
 
   | ReturnStmt None ->
-      emit state Ret
+      { state with current_code = Ret :: state.current_code }
 
   | ExprStmt expr ->
-      ignore (expr_to_ir state expr) (* 生成代码但忽略结果 *)
+      let (state', _) = expr_to_ir state expr in
+      state'  (* 忽略结果 *)
 
   | WhileStmt (cond, body) ->
-      let cond_label = fresh_label state "cond" in
-      let body_label = fresh_label state "body" in
-      let end_label = fresh_label state "end" in
-
-      state.loop_labels := (end_label, cond_label) :: !(state.loop_labels);
-      
-      emit state (Jmp cond_label);
-      emit state (Label body_label);
-      stmt_to_ir state body;
-      
-      emit state (Label cond_label);
-      let cond_reg = expr_to_ir state cond in
-      emit state (Branch ("bnez", cond_reg, RiscvReg "zero", body_label));
-      
-      emit state (Label end_label);
-      state.loop_labels := List.tl !(state.loop_labels)
+      let (state', loop_label) = fresh_label state "loop" in
+      let (state'', end_label) = fresh_label state' "end" in
+      let state1 = { 
+        state'' with 
+        current_code = Label loop_label :: state''.current_code 
+      } in
+      let (state2, cond_reg) = expr_to_ir state1 cond in
+      let state3 = { 
+        state2 with 
+        current_code = Branch ("beqz", cond_reg, RiscvReg "zero", end_label) :: state2.current_code 
+      } in
+      let state4 = stmt_to_ir state3 body in
+      let state5 = { 
+        state4 with 
+        current_code = Jmp loop_label :: state4.current_code 
+      } in
+      { state5 with current_code = Label end_label :: state5.current_code }
 
   | BreakStmt ->
-      match !(state.loop_labels) with
-      | (end_label, _) :: _ -> emit state (Jmp end_label)
-      | [] -> failwith "break statement outside loop"
+      (match state.loop_labels with
+      | (end_label, _) :: _ -> 
+          { state with current_code = Jmp end_label :: state.current_code }
+      | [] -> failwith "break statement outside loop")
 
   | ContinueStmt ->
-      match !(state.loop_labels) with
-      | (_, loop_label) :: _ -> emit state (Jmp loop_label)
-      | [] -> failwith "continue statement outside loop"
+      (match state.loop_labels with
+      | (_, loop_label) :: _ -> 
+          { state with current_code = Jmp loop_label :: state.current_code }
+      | [] -> failwith "continue statement outside loop")
 
-  | EmptyStmt -> ()
+  | EmptyStmt -> state
 
-and block_to_ir state block =
-  (* 创建新作用域帧 *)
-  let new_frame = create_frame (Some !(state.current_frame)) in
-  let old_frame = !(state.current_frame) in
-  state.current_frame := new_frame;
-  
-  List.iter (fun stmt -> stmt_to_ir state stmt) block.stmts;
-  
-  (* 恢复作用域 *)
-  state.current_frame := old_frame
+and block_to_ir state stmts =
+  List.fold_left stmt_to_ir state stmts
 
 (* ==================== 函数处理 ==================== *)
 let func_to_ir (func : Ast.func_def) : ir_func =
-  let state = initial_state () in
+  let init_state = initial_state () in
   
-  (* 预分配参数偏移量 *)
-  let param_offset i = i * 8 in
-  List.iteri (fun i (p : Ast.param) ->
-    let offset = param_offset i in
-    Hashtbl.replace state.var_offset p.name offset;
-    Hashtbl.replace (!(state.current_frame)).vr_map p.name Unknown;
-  ) func.params;
+  (* 预分配参数偏移量 - 避免多次查找 *)
+  let (state, _) = 
+    List.fold_left (fun (state, offset) (p : Ast.param) ->
+      let new_state = { 
+        state with 
+        var_offset = FastMap.add state.var_offset p.name offset;
+        stack_size = state.stack_size + 8;
+      } in
+      (new_state, offset + 8)
+    ) (init_state, 0) func.params
+  in
   
-  state.stack_size := List.length func.params * 8;
-  
-  block_to_ir state func.body;
+  let state' = block_to_ir state func.body.stmts in
   
   (* 16字节栈对齐 *)
   let aligned_stack_size = 
-    if !(state.stack_size) = 0 then 0
-    else ((!(state.stack_size) + 15) / 16) * 16 
+    if state'.stack_size = 0 then 0
+    else ((state'.stack_size + 15) land (lnot 15)) 
   in
   
   {
     name = func.name;
     params = List.map (fun p -> p.name) func.params;
-    body = List.rev !(state.current_code);
+    body = List.rev state'.current_code;
     stack_size = aligned_stack_size;
   }
 
@@ -290,42 +369,42 @@ let string_of_ir_instr = function
   | Mv (rd, rs) -> Printf.sprintf "mv %s, %s" (string_of_reg rd) (string_of_reg rs)
 
 let string_of_ir_func f =
-  let buffer = Buffer.create 256 in
-  Buffer.add_string buffer (Printf.sprintf ".global %s\n" f.name);
-  Buffer.add_string buffer (Printf.sprintf "%s:\n" f.name);
+  let b = Buffer.create 1024 in
+  Buffer.add_string b (Printf.sprintf ".global %s\n" f.name);
+  Buffer.add_string b (Printf.sprintf "%s:\n" f.name);
   
   if f.stack_size > 0 then
-    Buffer.add_string buffer (Printf.sprintf "  addi sp, sp, -%d\n" f.stack_size);
+    Buffer.add_string b (Printf.sprintf "  addi sp, sp, -%d\n" f.stack_size);
   
   List.iter (fun instr ->
-    Buffer.add_string buffer "  ";
-    Buffer.add_string buffer (string_of_ir_instr instr);
-    Buffer.add_char buffer '\n'
+    Buffer.add_string b "  ";
+    Buffer.add_string b (string_of_ir_instr instr);
+    Buffer.add_char b '\n'
   ) f.body;
   
   if f.stack_size > 0 then
-    Buffer.add_string buffer (Printf.sprintf "  addi sp, sp, %d\n" f.stack_size);
+    Buffer.add_string b (Printf.sprintf "  addi sp, sp, %d\n" f.stack_size);
   
-  Buffer.add_string buffer "  ret\n";
-  Buffer.contents buffer
+  Buffer.add_string b "  ret\n";
+  Buffer.contents b
 
 (* ==================== 主编译流程 ==================== *)
-let compile ast =
-  let state = initial_state () in
-  List.map func_to_ir ast
-
 let () =
-  (* 示例用法 - 需要实际实现文件读取和解析 *)
-  let ast = [] (* 这里应该是实际的AST *) in
-  let ir = compile ast in
+  let ch = open_in "test/04_while_break.tc" in
+  let ast = ToyC_riscv_lib.Parser.prog ToyC_riscv_lib.Lexer.token (Lexing.from_channel ch) in
+  close_in ch;
+  ToyC_riscv_lib.Semantic_analysis.semantic_analysis ast;
   
-  (* 输出RISC-V汇编 *)
-  let out = open_out "output.s" in
-  List.iter (fun func ->
-    Printf.fprintf out "%s\n" (string_of_ir_func func)
+  (* 生成IR *)
+  let ir = List.map func_to_ir ast in
+  
+  (* 输出IR *)
+  let out_ch = open_out "risc-V.txt" in
+  List.iter (fun f ->
+    output_string out_ch (string_of_ir_func f);
+    output_char out_ch '\n'
   ) ir;
-  close_out out
-
+  close_out out_ch;
+  
   print_endline "Compilation successful!";
-  print_endline "AST written to ast.txt";
   print_endline "Optimized RISC-V assembly written to risc-V.txt"
