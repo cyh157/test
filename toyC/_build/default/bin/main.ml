@@ -12,8 +12,9 @@ type reg =
   | Temp of int         (* 临时变量 *)
 
 type ir_instr =
-  | Lui of reg * int             (* 加载高20位 *)  (* 新增指令 *)
   | Li of reg * int                (* 加载立即数 *)
+  | Lui of reg * int               (* 加载高位立即数 *)
+  | Addi of reg * reg * int        (* 加立即数 *)
   | Mv of reg * reg                (* 寄存器间移动 *)
   | BinaryOp of string * reg * reg * reg (* 二元运算 *)
   | Branch of string * reg * reg * string (* 条件分支 *)
@@ -56,21 +57,14 @@ let fresh_label state prefix =
   let label = Printf.sprintf "%s%d" prefix state.label_counter in
   (label, {state with label_counter = state.label_counter + 1})
 
-(* 确保偏移量在2047范围内 *)
-let clamp_offset x = 
-  if x >= -2048 && x <= 2047 then x
-  else if x > 0 then 2047 
-  else -2048
-
-(* 修改：检查并限制偏移范围 *)
 let get_var_offset state var =
   try 
-    (clamp_offset (Hashtbl.find state.var_offset var), state)
+    (Hashtbl.find state.var_offset var, state)  (* 找到时返回偏移量和原状态 *)
   with Not_found -> 
     let offset = state.stack_size in
     Hashtbl.add state.var_offset var offset;
     let new_state = {state with stack_size = offset + 8} in
-    (clamp_offset offset, new_state)
+    (offset, new_state)  (* 未找到时返回新偏移量和更新后的状态 *)
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -287,13 +281,34 @@ let parse_channel ch =
         pos.Lexing.pos_lnum (pos.Lexing.pos_cnum - pos.Lexing.pos_bol + 1);
       exit 1
 
+(* ==================== 立即数处理 ==================== *)
+(* 增强型立即数加载函数 *)
+let load_imm reg n state =
+  if n >= -2048 && n <= 2047 then
+    ([Li (reg, n)], state)
+  else
+    (* 分步加载大立即数 *)
+    let upper = (n lsr 12) land 0xFFFFF in
+    let lower = n land 0xFFF in
+    
+    (* 处理低位部分的符号问题 *)
+    let code, state =
+      if lower >= 0x800 then
+        let upper = upper + 1 in
+        let lower = lower - 4096 in  (* 补码处理 *)
+        ([Lui (reg, upper); Addi (reg, reg, lower)], state)
+      else
+        ([Lui (reg, upper); Addi (reg, reg, lower)], state)
+    in
+    (code, state)
+
 (* ==================== AST到IR转换 ==================== *)
 let rec expr_to_ir state expr =
   match expr with
   | Num n -> 
       let (temp, state') = fresh_temp state in
-      (* 小立即数用Li，大立即数将用Lui+Li组合 *)
-      (temp, [Li (temp, n)], state')
+      let (code, state'') = load_imm temp n state' in
+      (temp, code, state'')
   | Var x -> 
       let offset, state' = get_var_offset state x in
       let (temp, state'') = fresh_temp state' in
@@ -416,13 +431,10 @@ let () =
   close_out out_ch;
    let ir = List.map func_to_ir ast in  (* 转换整个AST为IR *)
   
-  (* 新增：统一寄存器字符串转换 *)
-  let string_of_reg r = 
-    match r with 
-    | RiscvReg s -> s 
+  let string_of_reg = function
+    | RiscvReg s -> s
     | Temp n -> "t" ^ string_of_int n
-  in
-
+  
   let string_of_ir ir_func =
     let buf = Buffer.create 256 in
     Buffer.add_string buf (Printf.sprintf "Function: %s\n" ir_func.name);
@@ -431,15 +443,10 @@ let () =
     Buffer.add_string buf "\nBody:\n";
     List.iter (fun instr ->
       let instr_str = match instr with
-        | Lui (r, n) -> (* 处理lui指令 *)
-            Printf.sprintf "  lui %s, %%hi(%d)" (string_of_reg r) n
-        | Li (r, n) -> 
-            if n >= -2048 && n <= 2047 then
-              Printf.sprintf "  li %s, %d" (string_of_reg r) n
-            else 
-              Printf.sprintf "  addi %s, zero, %%lo(%d)" (string_of_reg r) n
-        | Mv (rd, rs) -> 
-            Printf.sprintf "  mv %s, %s" (string_of_reg rd) (string_of_reg rs)
+        | Li (r, n) -> Printf.sprintf "  li %s, %d" (string_of_reg r) n
+        | Lui (r, imm) -> Printf.sprintf "  lui %s, %d" (string_of_reg r) imm
+        | Addi (rd, rs, imm) -> Printf.sprintf "  addi %s, %s, %d" (string_of_reg rd) (string_of_reg rs) imm
+        | Mv (rd, rs) -> Printf.sprintf "  mv %s, %s" (string_of_reg rd) (string_of_reg rs)
         | BinaryOp (op, rd, rs1, rs2) ->
             Printf.sprintf "  %s %s, %s, %s" op
               (string_of_reg rd)
@@ -450,9 +457,9 @@ let () =
               (string_of_reg rs1)
               (string_of_reg rs2)
               label
-        | Jmp label -> "  j " ^ label
+        | Jmp label -> Printf.sprintf "  j %s" label
         | Label label -> label ^ ":"
-        | Call func -> "  call " ^ func
+        | Call func -> Printf.sprintf "  call %s" func
         | Ret -> "  ret"
         | Store (rs, base, offset) ->
             Printf.sprintf "  sd %s, %d(%s)"
@@ -465,17 +472,10 @@ let () =
               offset
               (string_of_reg base)
       in
-      Buffer.add_string buf (instr_str ^ "\n");
-      (* 为Li增加lui补充 *)
-      match instr with
-      | Li (r, n) when n < -2048 || n > 2047 -> 
-          Buffer.add_string buf (Printf.sprintf "  lui %s, %%hi(%d)\n" (string_of_reg r) n)
-      | _ -> ()
+      Buffer.add_string buf (instr_str ^ "\n")
     ) ir_func.body;
     Buffer.contents buf
-  in
   
-  (* 6. 输出IR到文件 *)
   let ir_out = open_out "risc-V.txt" in
   List.iter (fun f -> 
     Printf.fprintf ir_out "%s\n" (string_of_ir f)
