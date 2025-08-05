@@ -708,27 +708,39 @@ module LivenessAnalysis = struct
     RegSet.mem reg (get_live_regs info instr_index)
 end
 module IRToRiscV = struct
+  (* 辅助函数：判断IR寄存器是否映射到栈上 *)
+  let is_stack_temp = function
+    | Temp n when n >= 15 -> true
+    | _ -> false
 
-  (* 寄存器分配映射 *)
-  let reg_map var_offsets frame_size = function
+  (* 将IR寄存器映射到RISC-V寄存器或栈地址 *)
+  let reg_map = function
     | RiscvReg s -> s
     | Temp n ->
         if n < 7 then Printf.sprintf "t%d" n
         else if n < 15 then Printf.sprintf "a%d" (n - 7)
-        else (* 当寄存器不足时，使用栈空间，统一使用s0作为基址 *)
-          let stack_offset = -(68 + (n - 15 + 1) * 4) in
+        else
+          let stack_offset = -(68 + (n - 15) * 4) in
           Printf.sprintf "%d(s0)" stack_offset
+
+  (* 将IR寄存器映射到RISC-V硬件寄存器名称（不含栈地址） *)
+  let reg_map_to_reg = function
+    | RiscvReg s -> s
+    | Temp n ->
+        if n < 7 then Printf.sprintf "t%d" n
+        else if n < 15 then Printf.sprintf "a%d" (n - 7)
+        else
+          (* 对于分配到栈的Temp寄存器，使用临时硬件寄存器t0 *)
+          "t0"
 
   (* 辅助函数：将一个大立即数加载到寄存器中 *)
   let load_large_imm dest_reg imm =
     let lower_12 = imm land 0xFFF in
     let upper_20 = (imm lsr 12) in
-    (* 处理符号扩展，如果低12位是负数，则高20位需要加1 *)
     let adjusted_upper = if (lower_12 lsr 11) = 1 then upper_20 + 1 else upper_20 in
     Printf.sprintf "lui %s, %d\n  addi %s, %s, %d" dest_reg adjusted_upper dest_reg dest_reg lower_12
 
   (* 修改instr_to_asm函数以处理栈访问 *)
-  (* 修改 IRToRiscV 模块中的 instr_to_asm 函数 *)
   let instr_to_asm var_offsets frame_size instrs =
     let liveness_info = LivenessAnalysis.analyze_liveness instrs in
     let rec convert_instrs acc_index acc_code instr_list =
@@ -737,45 +749,84 @@ module IRToRiscV = struct
       | instr :: rest ->
           let code = match instr with
             | Li (r, n) -> 
-                (match r with
-                 | Temp temp_reg when temp_reg >= 15 -> 
-                     let stack_offset = -(8 + (temp_reg - 15 + 1) * 4) in
-                     if n >= -2048 && n <= 2047 then
+                if is_stack_temp r then
+                    let stack_offset = -(68 + (match r with Temp n -> n-15 | _ -> 0) * 4) in
+                    if n >= -2048 && n <= 2047 then
                         Printf.sprintf "  addi t0, zero, %d\n  sw t0, %d(s0)" n stack_offset
-                     else
+                    else
                         Printf.sprintf "  %s\n  sw t0, %d(s0)" (load_large_imm "t0" n) stack_offset
-                 | _ ->
-                     if n >= -2048 && n <= 2047 then
-                        Printf.sprintf "  addi %s, zero, %d" (reg_map var_offsets frame_size r) n
-                     else
-                        Printf.sprintf "  %s" (load_large_imm (reg_map var_offsets frame_size r) n))
+                else
+                    if n >= -2048 && n <= 2047 then
+                        Printf.sprintf "  addi %s, zero, %d" (reg_map r) n
+                    else
+                        Printf.sprintf "  %s" (load_large_imm (reg_map r) n)
 
             | Mv (rd, rs) ->
-                (match (rd, rs) with
-                 | (Temp n, _) when n >= 15 ->
-                     let stack_offset = -(8 + (n - 15 + 1) * 4) in
-                     Printf.sprintf "  mv t0, %s\n  sw t0, %d(s0)" (reg_map var_offsets frame_size rs) stack_offset
-                 | (_, Temp n) when n >= 15 ->
-                     let stack_offset = -(8 + (n - 15 + 1) * 4) in
-                     Printf.sprintf "  lw t0, %d(s0)\n  mv %s, t0" stack_offset (reg_map var_offsets frame_size rd)
-                 | _ ->
-                     Printf.sprintf "  mv %s, %s" (reg_map var_offsets frame_size rd) (reg_map var_offsets frame_size rs))
+                if is_stack_temp rd then
+                    if is_stack_temp rs then
+                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
+                        let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
+                        Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" rs_offset rd_offset
+                    else
+                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
+                        Printf.sprintf "  sw %s, %d(s0)" (reg_map rs) rd_offset
+                else if is_stack_temp rs then
+                    let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
+                    Printf.sprintf "  lw %s, %d(s0)" (reg_map rd) rs_offset
+                else
+                    Printf.sprintf "  mv %s, %s" (reg_map rd) (reg_map rs)
             
             | BinaryOp (op, rd, rs1, rs2) ->
-                Printf.sprintf "  %s %s, %s, %s" op (reg_map var_offsets frame_size rd) (reg_map var_offsets frame_size rs1) (reg_map var_offsets frame_size rs2)
-            
+                let rd_reg = if is_stack_temp rd then "t0" else reg_map rd in
+                let rs1_reg = if is_stack_temp rs1 then "t1" else reg_map rs1 in
+                let rs2_reg = if is_stack_temp rs2 then "t2" else reg_map rs2 in
+                let pre_code = 
+                    (if is_stack_temp rs1 then Printf.sprintf "  lw t1, %s\n" (reg_map rs1) else "") ^
+                    (if is_stack_temp rs2 then Printf.sprintf "  lw t2, %s\n" (reg_map rs2) else "") in
+                let main_code = Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg in
+                let post_code = if is_stack_temp rd then Printf.sprintf "\n  sw t0, %s" (reg_map rd) else "" in
+                pre_code ^ main_code ^ post_code
+
             | BinaryOpImm (op, rd, rs, imm) ->
-                (* 对于带立即数的指令，也需要检查立即数是否超范围 *)
-                if imm >= -2048 && imm <= 2047 then
-                    Printf.sprintf "  %s %s, %s, %d" op (reg_map var_offsets frame_size rd) (reg_map var_offsets frame_size rs) imm
+                if is_stack_temp rd then
+                    if is_stack_temp rs then
+                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
+                        let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
+                        let pre_code = Printf.sprintf "  lw t0, %d(s0)\n  lw t1, %d(s0)\n" rs_offset rd_offset in
+                        let main_code = Printf.sprintf "  %s t0, t0, %d" op imm in
+                        let post_code = Printf.sprintf "\n  sw t0, %d(s0)" rd_offset in
+                        pre_code ^ main_code ^ post_code
+                    else
+                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
+                        let rs_reg = reg_map rs in
+                        let pre_code = "" in
+                        let main_code = Printf.sprintf "  %s t0, %s, %d" op rs_reg imm in
+                        let post_code = Printf.sprintf "\n  sw t0, %d(s0)" rd_offset in
+                        pre_code ^ main_code ^ post_code
+                else if is_stack_temp rs then
+                    let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
+                    let rd_reg = reg_map rd in
+                    let pre_code = Printf.sprintf "  lw t0, %d(s0)\n" rs_offset in
+                    let main_code = Printf.sprintf "  %s %s, t0, %d" op rd_reg imm in
+                    pre_code ^ main_code
                 else
-                    (* 对于超范围的立即数，需要将其加载到临时寄存器中，再进行操作 *)
-                    let temp_reg = "t0" in
-                    Printf.sprintf "  %s\n  %s %s, %s, %s" (load_large_imm temp_reg imm) op (reg_map var_offsets frame_size rd) (reg_map var_offsets frame_size rs) temp_reg
-            
+                    if imm >= -2048 && imm <= 2047 then
+                      Printf.sprintf "  %s %s, %s, %d" op (reg_map rd) (reg_map rs) imm
+                    else
+                      let temp_reg = "t0" in
+                      Printf.sprintf "  %s\n  %s %s, %s, %s" (load_large_imm temp_reg imm) op (reg_map rd) (reg_map rs) temp_reg
+
             | Branch (op, r1, r2, label) ->
-                Printf.sprintf "  %s %s, %s, %s" op (reg_map var_offsets frame_size r1) (reg_map var_offsets frame_size r2) label
-            
+                if is_stack_temp r1 || is_stack_temp r2 then
+                    let r1_reg = if is_stack_temp r1 then "t0" else reg_map r1 in
+                    let r2_reg = if is_stack_temp r2 then "t1" else reg_map r2 in
+                    let pre_code = 
+                        (if is_stack_temp r1 then Printf.sprintf "  lw t0, %s\n" (reg_map r1) else "") ^
+                        (if is_stack_temp r2 then Printf.sprintf "  lw t1, %s\n" (reg_map r2) else "") in
+                    pre_code ^ (Printf.sprintf "  %s %s, %s, %s" op r1_reg r2_reg label)
+                else
+                    Printf.sprintf "  %s %s, %s, %s" op (reg_map r1) (reg_map r2) label
+
             | Jmp label ->
                 Printf.sprintf "  j %s" label
             
@@ -789,26 +840,38 @@ module IRToRiscV = struct
                 Printf.sprintf "  ret"
             
             | Store (src, base, offset) ->
+                let src_reg = if is_stack_temp src then "t0" else reg_map src in
+                let pre_code = if is_stack_temp src then Printf.sprintf "  lw t0, %s\n" (reg_map src) else "" in
                 if offset >= -2048 && offset <= 2047 then
-                  Printf.sprintf "  sw %s, %d(%s)" (reg_map var_offsets frame_size src) offset (reg_map var_offsets frame_size base)
+                  pre_code ^ Printf.sprintf "  sw %s, %d(%s)" src_reg offset (reg_map base)
                 else
-                  let temp_reg = "t0" in
-                  Printf.sprintf "  %s\n  sw %s, 0(%s)" (load_large_imm temp_reg offset) (reg_map var_offsets frame_size src) temp_reg
+                  let temp_reg = "t1" in
+                  pre_code ^ Printf.sprintf "  %s\n  sw %s, 0(%s)" (load_large_imm temp_reg offset) src_reg (reg_map base)
 
             | Load (dest, base, offset) ->
+                let dest_reg = if is_stack_temp dest then "t0" else reg_map dest in
+                let post_code = if is_stack_temp dest then Printf.sprintf "\n  sw t0, %s" (reg_map dest) else "" in
                 if offset >= -2048 && offset <= 2047 then
-                  Printf.sprintf "  lw %s, %d(%s)" (reg_map var_offsets frame_size dest) offset (reg_map var_offsets frame_size base)
+                  Printf.sprintf "  lw %s, %d(%s)%s" dest_reg offset (reg_map base) post_code
                 else
-                  let temp_reg = "t0" in
-                  Printf.sprintf "  %s\n  lw %s, 0(%s)" (load_large_imm temp_reg offset) (reg_map var_offsets frame_size dest) temp_reg
+                  let temp_reg = "t1" in
+                  Printf.sprintf "  %s\n  lw %s, 0(%s)%s" (load_large_imm temp_reg offset) dest_reg (reg_map base) post_code
             
             | ReloadVar (r, name) ->
                 let offset = Hashtbl.find var_offsets name in
-                if offset >= -2048 && offset <= 2047 then
-                  Printf.sprintf "  lw %s, %d(%s)" (reg_map var_offsets frame_size r) offset (reg_map var_offsets frame_size (RiscvReg "s0"))
+                if is_stack_temp r then
+                    let r_offset = -(68 + (match r with Temp n -> n-15 | _ -> 0) * 4) in
+                    if offset >= -2048 && offset <= 2047 then
+                        Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" offset r_offset
+                    else
+                        let temp_reg = "t0" in
+                        Printf.sprintf "  %s\n  lw t1, 0(%s)\n  sw t1, %d(s0)" (load_large_imm temp_reg offset) temp_reg r_offset
                 else
-                  let temp_reg = "t0" in
-                  Printf.sprintf "  %s\n  lw %s, 0(%s)" (load_large_imm temp_reg offset) (reg_map var_offsets frame_size r) temp_reg
+                    if offset >= -2048 && offset <= 2047 then
+                      Printf.sprintf "  lw %s, %d(s0)" (reg_map r) offset
+                    else
+                      let temp_reg = "t0" in
+                      Printf.sprintf "  %s\n  lw %s, 0(%s)" (load_large_imm temp_reg offset) (reg_map r) temp_reg
           in
           convert_instrs (acc_index + 1) (acc_code ^ "\n" ^ code) rest
     in
