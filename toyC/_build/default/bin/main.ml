@@ -431,16 +431,12 @@ let rec expr_to_ir state expr =
             (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state_final)
         | Sub -> 
     (match e2 with
+    | Num n when n >= -2048 && n <= 2047 -> 
+        (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final)
     | Num n -> 
-        let imm_val = -n in
-        (* 添加立即数范围检查 *)
-        if imm_val >= -2048 && imm_val <= 2047 then
-            (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, imm_val)], state_final)
-        else
-            (* 生成Li + sub指令 *)
-            let (imm_reg, state') = fresh_temp state_final in
-            let code = e1_code @ [Li (imm_reg, n); BinaryOp ("sub", temp, e1_reg, imm_reg)] in
-            (temp, code, free_temp state' imm_reg)
+        (* 处理大立即数情况 *)
+        let (imm_reg, imm_code, state_imm) = expr_to_ir state_final (Num n) in
+        (temp, e1_code @ imm_code @ [BinaryOp ("sub", temp, e1_reg, imm_reg)], state_imm)
     | _ -> 
         (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
         | Mul -> 
@@ -823,10 +819,16 @@ let instr_to_asm var_offsets frame_size instrs =
                         let stack_offset = -(8 + (m - 15 + 1) * 4) in
                         Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                     | _ -> ""))
-          | BinaryOpImm (op, rd, rs, imm) ->
-    (* 添加立即数范围验证 *)
+         | BinaryOpImm (op, rd, rs, imm) ->
+    (* 处理超出范围的立即数 *)
     if imm < -2048 || imm > 2047 then
-        failwith (Printf.sprintf "立即数 %d 超出范围 [-2048,2047]" imm)
+        let imm_temp = "t3" in (* 使用 t3 临时寄存器 *)
+        Printf.sprintf "  li %s, %d\n" imm_temp imm ^
+        Printf.sprintf "  %s %s, %s, %s" 
+            (String.sub op 0 (String.length op - 1)) (* 移除"i"后缀 *)
+            (reg_map var_offsets frame_size rd)
+            (reg_map var_offsets frame_size rs)
+            imm_temp
     else
               (match (rd, rs) with
               | (Temp n, _) when n >= 15 -> 
