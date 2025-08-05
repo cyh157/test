@@ -533,11 +533,11 @@ let rec stmt_to_ir state stmt =
       let (then_label, state'') = fresh_label state' "then" in
       let (else_label, state''') = fresh_label state'' "else" in
       let (merge_label, state'''') = fresh_label state''' "merge" in
-      let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
+      let (then_code, state'''') = stmt_to_ir state'''' then_stmt in
       let (else_code, state'''''') = 
         match else_stmt_opt with
         | Some s -> stmt_to_ir state''''' s
-        | None -> ([], state''''') in
+        | None -> ([], state'''') in
       let state_final = free_temp state'''''' cond_reg in (* 释放条件寄存器 *)
       (cond_code @ 
        [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
@@ -743,7 +743,7 @@ module IRToRiscV = struct
     | _ -> failwith "Unsupported immediate operation"
 
   (* 辅助函数：将一个大立即数加载到寄存器中 *)
-   let load_large_imm dest_reg imm =
+  let load_large_imm dest_reg imm =
     let signed_lower = imm land 0xFFF in
     let upper_20 = (imm asr 12) land 0xFFFFF in
     let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
@@ -822,8 +822,11 @@ module IRToRiscV = struct
                       (if is_stack_temp rs then Printf.sprintf "  lw %s, %s\n" rs_reg (reg_map rs) else "") in
                     let post_code =
                       (if is_stack_temp rd then Printf.sprintf "\n  sw %s, %s" rd_reg (reg_map rd) else "") in
-                    pre_code ^ (Printf.sprintf "  li %s, %d\n  %s %s, %s, %s%s"
-                    temp_reg imm (op_to_rr_op op) rd_reg rs_reg temp_reg) ^ post_code
+                    pre_code ^ 
+                    (Printf.sprintf "  %s\n  %s %s, %s, %s%s"
+                      (load_large_imm temp_reg imm)
+                      (op_to_rr_op op) rd_reg rs_reg temp_reg) ^ 
+                    post_code
             
             | Branch (op, r1, r2, label) ->
                 if is_stack_temp r1 || is_stack_temp r2 then
