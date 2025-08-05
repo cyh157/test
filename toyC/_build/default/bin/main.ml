@@ -431,12 +431,13 @@ let rec expr_to_ir state expr =
             (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state_final)
         | Sub -> 
     (match e2 with
-    | Num n when n >= -2048 && n <= 2047 -> 
-        (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final)
     | Num n -> 
-        (* 处理大立即数情况 *)
-        let (imm_reg, imm_code, state_imm) = expr_to_ir state_final (Num n) in
-        (temp, e1_code @ imm_code @ [BinaryOp ("sub", temp, e1_reg, imm_reg)], state_imm)
+        let neg_n = -n in
+        if neg_n >= -2048 && neg_n <= 2047 then
+            (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, neg_n)], state_final)
+        else
+            let (imm_reg, imm_code, state_imm) = expr_to_ir state_final (Num n) in
+            (temp, e1_code @ imm_code @ [BinaryOp ("sub", temp, e1_reg, imm_reg)], state_imm)
     | _ -> 
         (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
         | Mul -> 
