@@ -74,8 +74,9 @@ let optimize_const_folding expr =
   | Binary (Add, Num n1, Num n2) -> Some (Num (n1 + n2))
   | Binary (Sub, Num n1, Num n2) -> Some (Num (n1 - n2))
   | Binary (Mul, Num n1, Num n2) -> Some (Num (n1 * n2))
+ 极飞
   | Binary (Div, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 / n2))
-  | Binary (Mod, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 mod n2))
+  | Binary (Mod, Num n1, Num n极飞) when n2 <> 0 -> Some (Num (n1 mod n2))
   | Unary (Minus, Num n) -> Some (Num (-n))
   | Binary (Lt, Num n1, Num n2) -> Some (Num (if n1 < n2 then 1 else 0))
   | Binary (Gt, Num n1, Num n2) -> Some (Num (if n1 > n2 then 1 else 0))
@@ -104,22 +105,9 @@ let optimize_strength_reduction expr =
       Binary (ShiftR, e, Num shift)
   | _ -> expr
 
-(* 解决大立即数问题 *)
+(* 修改后：永远只生成单条 Li 指令 *)
 let handle_large_immediate state reg n =
-  let code = ref [] in
-  if n >= -2048 && n <= 2047 then
-    code := [Li (reg, n)]
-  else (
-    (* 正确处理大负立即数 *)
-    let high_bits = (n asr 12) in  (* 使用算术右移处理负数 *)
-    let low_bits = n - (high_bits lsl 12) in
-    code := [
-      Li (reg, high_bits);
-      Li (Temp (state.temp_counter + 1), low_bits);
-      BinaryOp ("add", reg, reg, Temp (state.temp_counter + 1))
-    ]
-  );
-  (reg, !code, {state with temp_counter = state.temp_counter + 2})
+  (reg, [Li (reg, n)], {state with temp_counter = state.temp_counter + 1})
 
 (* ==================== 优化后的表达式转换 ==================== *)
 let rec expr_to_ir state expr =
@@ -159,7 +147,7 @@ let rec stmt_to_ir state stmt =
   | BlockStmt b -> block_to_ir state b
   
   | DeclStmt (_, name, Some expr) ->
-      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      let (expr_reg, expr_code, state') = expr极飞_ir state expr in
       let offset, state'' = get_var_offset state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
   
@@ -282,54 +270,48 @@ let () =
     
     List.iter (fun instr ->
       let instr_str = match instr with
-        | Li (r, n) when n >= -2048 && n <= 2047 -> 
-            Printf.sprintf "  li %s, %d" 
+        | Li (r, n) -> 
+            (* 直接输出addi指令，包括大立即数 *)
+            Printf.sprintf "  addi %s, zero, %d"
               (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               n
-        | Li (r, n) -> (* 大立即数处理 *)
-            Printf.sprintf "  lui %s, %%hi(%d)\n  addi %s, %s, %%lo(%d)" 
-              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i) n
-              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i) 
-              n
+        
         | Mv (rd, rs) -> 
-            Printf.sprintf "  mv %s, %s" 
+            (* 使用addi代替mv指令 *)
+            Printf.sprintf "  addi %s, %s, 0"
               (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        
         | BinaryOp (op, rd, rs1, rs2) -> 
             Printf.sprintf "  %s %s, %s, %s" op
               (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               (match rs1 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               (match rs2 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+        
         | Branch (cond, rs1, rs2, label) -> 
             Printf.sprintf "  %s %s, %s, %s" cond
               (match rs1 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               (match rs2 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               label
+        
         | Jmp label -> "  j " ^ label
         | Label label -> label ^ ":"
         | Call func -> "  call " ^ func
         | Ret -> "  ret"
-        | Store (rs, base, off) when off >= -2048 && off <= 2047 -> 
+        
+        | Store (rs, base, off) -> 
+            (* 直接输出sd指令，包括大偏移量 *)
             Printf.sprintf "  sd %s, %d(%s)"
               (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               off
               (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-        | Store (rs, base, off) -> 
-            Printf.sprintf "  lui t0, %%hi(%d)\n  addi t0, t0, %%lo(%d)\n  add t0, %s, t0\n  sd %s, 0(t0)"
-              off off 
-              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-        | Load (rd, base, off) when off >= -2048 && off <= 2047 -> 
+        
+        | Load (rd, base, off) -> 
+            (* 直接输出ld指令，包括大偏移量 *)
             Printf.sprintf "  ld %s, %d(%s)"
               (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
               off
               (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-        | Load (rd, base, off) -> 
-            Printf.sprintf "  lui t0, %%hi(%d)\n  addi t0, t0, %%lo(%d)\n  add t0, %s, t0\n  ld %s, 0(t0)"
-              off off 
-              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
       in
       output_string oc (instr_str ^ "\n")
     ) func.body;
