@@ -12,11 +12,12 @@ type reg =
   | Temp of int
 
 type ir_instr =
-  | Lui of reg * int  (* 高位立即数 *)
-  | Addi of reg * reg * int (* 带立即数的加法 *)
+  | Li of reg * int
+  | Lui of reg * int
+  | Addi of reg * reg * int
   | Mv of reg * reg
   | BinaryOp of string * reg * reg * reg
-  | Branch of string极飞 * reg * reg * string
+  | Branch of string * reg * reg * string
   | Jmp of string
   | Label of string
   | Call of string
@@ -77,7 +78,7 @@ let optimize_const_folding expr =
   | Binary (Mul, Num n1, Num n2) -> Some (Num (n1 * n2))
   | Binary (Div, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 / n2))
   | Binary (Mod, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 mod n2))
-  | Unary (Minus, Num n) -> Some (Num (-n))
+  | Unary (Minus,极飞 Num n) -> Some (Num (-n))
   | Binary (Lt, Num n1, Num n2) -> Some (Num (if n1 < n2 then 1 else 0))
   | Binary (Gt, Num n1, Num n2) -> Some (Num (if n1 > n2 then 1 else 0))
   | Binary (Leq, Num n1, Num n2) -> Some (Num (if n1 <= n2 then 1 else 0))
@@ -125,11 +126,10 @@ let handle_large_immediate state reg n =
         (high_bits, low_bits)
     in
     
-    let (temp, state1) = fresh_temp state in
     (reg, [
         Lui (reg, adjusted_high);   (* 加载高20位 *)
         Addi (reg, reg, adjusted_low)   (* 添加低12位 *)
-      ], {state1 with temp_counter = state.temp_counter + 2})
+      ], {state with temp_counter = state.temp_counter + 1})
 
 (* ==================== 优化后的表达式转换 ==================== *)
 let rec expr_to_ir state expr =
