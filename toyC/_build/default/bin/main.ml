@@ -12,12 +12,11 @@ type reg =
   | Temp of int
 
 type ir_instr =
-  | Li of reg * int
-  | Lui of reg * int  (* 新增：用于高位立即数 *)
-  | Addi of reg * reg * int  (* 新增：带立即数的加法 *)
+  | Lui of reg * int  (* 高位立即数 *)
+  | Addi of reg * reg * int (* 带立即数的加法 *)
   | Mv of reg * reg
   | BinaryOp of string * reg * reg * reg
-  | Branch of string * reg * reg * string
+  | Branch of string极飞 * reg * reg * string
   | Jmp of string
   | Label of string
   | Call of string
@@ -73,7 +72,7 @@ let get_var_offset state var =
 (* 常量折叠优化 *)
 let optimize_const_folding expr =
   match expr with
-  | Binary (Add, Num n1,极飞 Num n2) -> Some (Num (n1 + n2))
+  | Binary (Add, Num n1, Num n2) -> Some (Num (n1 + n2))
   | Binary (Sub, Num n1, Num n2) -> Some (Num (n1 - n2))
   | Binary (Mul, Num n1, Num n2) -> Some (Num (n1 * n2))
   | Binary (Div, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 / n2))
@@ -106,20 +105,30 @@ let optimize_strength_reduction expr =
       Binary (ShiftR, e, Num shift)
   | _ -> expr
 
-(* 修复：正确处理大立即数 (包括负数) *)
+(* 修复的立即数处理函数 *)
 let handle_large_immediate state reg n =
   if n >= -2048 && n <= 2047 then
-    (* 小立即数直接使用 addi *)
-    (reg, [Addi (reg, RiscvReg "zero", n)], {state with temp_counter = state.temp_counter + 1})
+    (reg, [Addi (reg, RiscvReg "zero", n)], 
+     {state with temp_counter = state.temp_counter + 1})
   else
-    (* 大立即数需要拆分为lui + addi *)
-    let adjusted_n = if n < 0 then n + 0x1000_0000 else n in
-    let high_bits = (adjusted_n asr 12) in
-    let low_bits = adjusted_n - (high_bits lsl 12) in
+    (* 正确拆分大立即数（包括负数） *)
+    let high_bits = (n asr 12) in
+    let low_bits = n - (high_bits lsl 12) in
+    
+    (* 确保低位在[-2048, 2047]范围内 *)
+    let (adjusted_high, adjusted_low) = 
+      if low_bits < -2048 then
+        (high_bits - 1, n - ((high_bits - 1) lsl 12))
+      else if low_bits > 2047 then
+        (high_bits + 1, n - ((high_bits + 1) lsl 12))
+      else
+        (high_bits, low_bits)
+    in
+    
     let (temp, state1) = fresh_temp state in
     (reg, [
-        Lui (reg, high_bits);   (* 加载高20位 *)
-        Addi (reg, reg, low_bits)   (* 添加低12位 *)
+        Lui (reg, adjusted_high);   (* 加载高20位 *)
+        Addi (reg, reg, adjusted_low)   (* 添加低12位 *)
       ], {state1 with temp_counter = state.temp_counter + 2})
 
 (* ==================== 优化后的表达式转换 ==================== *)
@@ -288,14 +297,16 @@ let () =
       in
       
       let instr_str = match instr with
-        | Addi (rd, rs, n) ->
-            Printf.sprintf "  addi %s, %s, %d" (reg_to_str rd) (reg_to_str rs) n
-            
         | Lui (rd, n) ->
-            Printf.sprintf "  lui %s, %%hi(%d)" (reg_to_str rd) n
+            Printf.sprintf "  lui %s, %d" (reg_to_str rd) n
             
+        | Addi (rd, rs, n) ->
+            Printf.sprintf "  addi %s, %s, %d" 
+              (reg_to_str rd) (reg_to_str rs) n
+              
         | Mv (rd, rs) -> 
-            Printf.sprintf "  addi %s, %s, 0" (reg_to_str rd) (reg_to_str rs)
+            Printf.sprintf "  mv %s, %s" 
+              (reg_to_str rd) (reg_to_str rs)
             
         | BinaryOp (op, rd, rs1, rs2) -> 
             Printf.sprintf "  %s %s, %s, %s" op
@@ -310,13 +321,31 @@ let () =
         | Call func -> "  call " ^ func
         | Ret -> "  ret"
         
-        | Store (rs, base, off) -> 
+        | Store (rs, base, off) when off >= -2048 && off <= 2047 -> 
             Printf.sprintf "  sd %s, %d(%s)"
               (reg_to_str rs) off (reg_to_str base)
-        
-        | Load (rd, base, off) -> 
+              
+        | Store (rs, base, off) -> 
+            (* 大偏移量需要单独处理 *)
+            let (temp, _) = fresh_temp initial_state in
+            Printf.sprintf "  lui %s, %%hi(%d)\n  addi %s, %s, %%lo(%d)\n  add %s, %s, %s\n  sd %s, 0(%s)" 
+              (reg_to_str temp) off 
+              (reg_to_str temp) (reg_to_str temp) off
+              (reg_to_str temp) (reg_to_str base) (reg_to_str temp)
+              (reg_to_str rs) (reg_to_str temp)
+              
+        | Load (rd, base, off) when off >= -2048 && off <= 2047 -> 
             Printf.sprintf "  ld %s, %d(%s)"
               (reg_to_str rd) off (reg_to_str base)
+              
+        | Load (rd, base, off) -> 
+            (* 大偏移量需要单独处理 *)
+            let (temp, _) = fresh_temp initial_state in
+            Printf.sprintf "  lui %s, %%hi(%d)\n  addi %s, %s, %%lo(%d)\n  add %s, %s, %s\n  ld %s, 0(%s)" 
+              (reg_to_str temp) off 
+              (reg_to_str temp) (reg_to_str temp) off
+              (reg_to_str temp) (reg_to_str base) (reg_to_str temp)
+              (reg_to_str rd) (reg_to_str temp)
       in
       output_string oc (instr_str ^ "\n")
     ) func.body;
