@@ -430,11 +430,19 @@ let rec expr_to_ir state expr =
         | Add -> 
             (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state_final)
         | Sub -> 
-          (match e2 with
-          | Num n -> 
-              (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final) 
-          | _ -> 
-              (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
+    (match e2 with
+    | Num n -> 
+        let imm_val = -n in
+        (* 添加立即数范围检查 *)
+        if imm_val >= -2048 && imm_val <= 2047 then
+            (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, imm_val)], state_final)
+        else
+            (* 生成Li + sub指令 *)
+            let (imm_reg, state') = fresh_temp state_final in
+            let code = e1_code @ [Li (imm_reg, n); BinaryOp ("sub", temp, e1_reg, imm_reg)] in
+            (temp, code, free_temp state' imm_reg)
+    | _ -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
         | Mul -> 
             (* 检查e1和e2中是否有函数调用 *)
             let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
@@ -816,6 +824,10 @@ let instr_to_asm var_offsets frame_size instrs =
                         Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                     | _ -> ""))
           | BinaryOpImm (op, rd, rs, imm) ->
+    (* 添加立即数范围验证 *)
+    if imm < -2048 || imm > 2047 then
+        failwith (Printf.sprintf "立即数 %d 超出范围 [-2048,2047]" imm)
+    else
               (match (rd, rs) with
               | (Temp n, _) when n >= 15 -> 
                   let stack_offset = -(8 + (n - 15 + 1) * 4) in
