@@ -8,22 +8,21 @@ module StringMap = Map.Make(String)
 
 (* ==================== IR 定义 ==================== *)
 type reg = 
-  | RiscvReg of string
-  | Temp of int
+  | RiscvReg of string  (* RISC-V寄存器如x1-x31 *)
+  | Temp of int         (* 临时变量 *)
 
 type ir_instr =
-  | Li of reg * int
-  | Lui of reg * int
-  | Addi of reg * reg * int
-  | Mv of reg * reg
-  | BinaryOp of string * reg * reg * reg
-  | Branch of string * reg * reg * string
-  | Jmp of string
-  | Label of string
-  | Call of string
-  | Ret
-  | Store of reg * reg * int
-  | Load of reg * reg * int
+  | Li of reg * int                (* 加载立即数 *)
+  | Lui of reg * int               (* 加载高20位 *)
+  | Mv of reg * reg                (* 寄存器间移动 *)
+  | BinaryOp of string * reg * reg * reg (* 二元运算 *)
+  | Branch of string * reg * reg * string (* 条件分支 *)
+  | Jmp of string                  (* 无条件跳转 *)
+  | Label of string                (* 标签 *)
+  | Call of string                 (* 函数调用 *)
+  | Ret                           (* 返回 *)
+  | Store of reg * reg * int       (* 存储到内存 *)
+  | Load of reg * reg * int        (* 从内存加载 *)
 
 type ir_func = {
   name: string;
@@ -31,15 +30,13 @@ type ir_func = {
   body: ir_instr list;
 }
 
-(* ==================== 优化后的代码生成状态 ==================== *)
+(* ==================== 代码生成状态 ==================== *)
 type codegen_state = {
   temp_counter: int;
   label_counter: int;
-  var_offset: (string, int) Hashtbl.t;
-  stack_size: int;
-  loop_labels: (string * string) list;
-  const_env: (reg, int) Hashtbl.t;
-  copy_env: (reg, reg) Hashtbl.t;
+  var_offset: (string, int) Hashtbl.t; (* 变量在栈帧中的偏移量 *)
+  stack_size: int; (* 当前栈帧大小 *)
+  loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
 }
 
 let initial_state = {
@@ -48,11 +45,9 @@ let initial_state = {
   var_offset = Hashtbl.create 10;
   stack_size = 0;
   loop_labels = [];
-  const_env = Hashtbl.create 10;
-  copy_env = Hashtbl.create 10;
 }
 
-(* ==================== 优化后的辅助函数 ==================== *)
+(* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
   let temp = state.temp_counter in
   (Temp temp, {state with temp_counter = temp + 1})
@@ -63,87 +58,46 @@ let fresh_label state prefix =
 
 let get_var_offset state var =
   try 
-    (Hashtbl.find state.var_offset var, state)
+    (Hashtbl.find state.var_offset var, state)  (* 找到时返回偏移量和原状态 *)
   with Not_found -> 
     let offset = state.stack_size in
     Hashtbl.add state.var_offset var offset;
     let new_state = {state with stack_size = offset + 8} in
-    (offset, new_state)
+    (offset, new_state)  (* 未找到时返回新偏移量和更新后的状态 *)
 
-(* 常量折叠优化 *)
-let optimize_const_folding expr =
-  match expr with
-  | Binary (Add, Num n1, Num n2) -> Some (Num (n1 + n2))
-  | Binary (Sub, Num n1, Num n2) -> Some (Num (n1 - n2))
-  | Binary (Mul, Num n1, Num n2) -> Some (Num (n1 * n2))
-  | Binary (Div, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 / n2))
-  | Binary (Mod, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 mod n2))
-  | Unary (Minus,极飞 Num n) -> Some (Num (-n))
-  | Binary (Lt, Num n1, Num n2) -> Some (Num (if n1 < n2 then 1 else 0))
-  | Binary (Gt, Num n1, Num n2) -> Some (Num (if n1 > n2 then 1 else 0))
-  | Binary (Leq, Num n1, Num n2) -> Some (Num (if n1 <= n2 then 1 else 0))
-  | Binary (Geq, Num n1, Num n2) -> Some (Num (if n1 >= n2 then 1 else 0))
-  | Binary (Eq, Num n1, Num n2) -> Some (Num (if n1 = n2 then 1 else 0))
-  | Binary (Neq, Num n1, Num n2) -> Some (Num (if n1 <> n2 then 1 else 0))
-  | Binary (And, Num n1, Num n2) -> Some (Num (if n1 <> 0 && n2 <> 0 then 1 else 0))
-  | Binary (Or, Num n1, Num n2) -> Some (Num (if n1 <> 0 || n2 <> 0 then 1 else 0))
-  | _ -> None
-
-(* 强度削弱优化 *)
-let optimize_strength_reduction expr =
-  match expr with
-  | Binary (Mul, e, Num n) when n > 0 && n land (n - 1) = 0 -> (* 幂为2 *)
-      let shift = int_of_float (log (float n) /. log 2. +. 0.5) in
-      Binary (ShiftL, e, Num shift)
-  | Binary (Mul, e, Num n) when n = 3 -> 
-      Binary (Add, e, Binary (ShiftL, e, Num 1))
-  | Binary (Mul, e, Num n) when n = 5 -> 
-      Binary (Add, e, Binary (ShiftL, e, Num 2))
-  | Binary (Mul, e, Num n) when n = 9 -> 
-      Binary (Add, e, Binary (ShiftL, e, Num 3))
-  | Binary (Div, e, Num n) when n > 0 && n land (n - 1) = 0 ->
-      let shift = int_of_float (log (float n) /. log 2. +. 0.5) in
-      Binary (ShiftR, e, Num shift)
-  | _ -> expr
-
-(* 修复的立即数处理函数 *)
+(* 处理大立即数（核心修复） *)
 let handle_large_immediate state reg n =
-  if n >= -2048 && n <= 2047 then
-    (reg, [Addi (reg, RiscvReg "zero", n)], 
-     {state with temp_counter = state.temp_counter + 1})
-  else
-    (* 正确拆分大立即数（包括负数） *)
-    let high_bits = (n asr 12) in
-    let low_bits = n - (high_bits lsl 12) in
-    
-    (* 确保低位在[-2048, 2047]范围内 *)
-    let (adjusted_high, adjusted_low) = 
-      if low_bits < -2048 then
-        (high_bits - 1, n - ((high_bits - 1) lsl 12))
-      else if low_bits > 2047 then
-        (high_bits + 1, n - ((high_bits + 1) lsl 12))
-      else
-        (high_bits, low_bits)
-    in
-    
-    (reg, [
-        Lui (reg, adjusted_high);   (* 加载高20位 *)
-        Addi (reg, reg, adjusted_low)   (* 添加低12位 *)
-      ], {state with temp_counter = state.temp_counter + 1})
-
-(* ==================== 优化后的表达式转换 ==================== *)
-let rec expr_to_ir state expr =
-  (* 应用优化 *)
-  let expr = match optimize_const_folding expr with
-    | Some e -> e
-    | None -> expr
-  in
-  let expr = optimize_strength_reduction expr in
+  (* 正确拆分大立即数（包括负数） *)
+  let high_bits = (n asr 12) in
+  let low_bits = n - (high_bits lsl 12) in
   
+  (* 确保低位在[-2048, 2047]范围内 *)
+  let (adjusted_high, adjusted_low) = 
+    if low_bits < -2048 then
+      (high_bits - 1, n - ((high_bits - 1) lsl 12))
+    else if low_bits > 2047 then
+      (high_bits + 1, n - ((high_bits + 1) lsl 12))
+    else
+      (high_bits, low_bits)
+  in
+  
+  (reg, [
+      Lui (reg, adjusted_high);   (* 加载高20位 *)
+      Addi (reg, reg, adjusted_low)   (* 添加低12位 *)
+    ], {state with temp_counter = state.temp_counter + 1})
+
+(* ==================== 表达式转换 ==================== *)
+let rec expr_to_ir state expr =
   match expr with
   | Num n -> 
-      handle_large_immediate state (Temp state.temp_counter) n
-      
+      (* 核心修复：处理大立即数 *)
+      if n >= -2048 && n <= 2047 then
+        let (temp, state') = fresh_temp state in
+        (temp, [Li (temp, n)], state')
+      else
+        let (temp, state') = fresh_temp state in
+        handle_large_immediate state' temp n
+        
   | Var x -> 
       let offset, state' = get_var_offset state x in
       let (temp, state'') = fresh_temp state' in
@@ -163,7 +117,7 @@ let rec expr_to_ir state expr =
   
   | _ -> failwith "Unsupported expression"
 
-(* ==================== 优化后的语句转换 ==================== *)
+(* ==================== 语句转换 ==================== *)
 let rec stmt_to_ir state stmt =
   match stmt with
   | BlockStmt b -> block_to_ir state b
@@ -251,7 +205,7 @@ and block_to_ir state block =
     (code_acc @ code, st')
   ) ([], state) block.stmts
 
-(* ==================== 优化后的函数转换 ==================== *)
+(* ==================== 函数转换 ==================== *)
 let func_to_ir (func : Ast.func_def) : ir_func =
   let state = { 
     initial_state with 
