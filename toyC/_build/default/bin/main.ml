@@ -13,6 +13,8 @@ type reg =
 
 type ir_instr =
   | Li of reg * int
+  | Lui of reg * int  (* 新增：用于高位立即数 *)
+  | Addi of reg * reg * int  (* 新增：带立即数的加法 *)
   | Mv of reg * reg
   | BinaryOp of string * reg * reg * reg
   | Branch of string * reg * reg * string
@@ -71,12 +73,11 @@ let get_var_offset state var =
 (* 常量折叠优化 *)
 let optimize_const_folding expr =
   match expr with
-  | Binary (Add, Num n1, Num n2) -> Some (Num (n1 + n2))
+  | Binary (Add, Num n1,极飞 Num n2) -> Some (Num (n1 + n2))
   | Binary (Sub, Num n1, Num n2) -> Some (Num (n1 - n2))
   | Binary (Mul, Num n1, Num n2) -> Some (Num (n1 * n2))
- 极飞
   | Binary (Div, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 / n2))
-  | Binary (Mod, Num n1, Num n极飞) when n2 <> 0 -> Some (Num (n1 mod n2))
+  | Binary (Mod, Num n1, Num n2) when n2 <> 0 -> Some (Num (n1 mod n2))
   | Unary (Minus, Num n) -> Some (Num (-n))
   | Binary (Lt, Num n1, Num n2) -> Some (Num (if n1 < n2 then 1 else 0))
   | Binary (Gt, Num n1, Num n2) -> Some (Num (if n1 > n2 then 1 else 0))
@@ -105,9 +106,21 @@ let optimize_strength_reduction expr =
       Binary (ShiftR, e, Num shift)
   | _ -> expr
 
-(* 修改后：永远只生成单条 Li 指令 *)
+(* 修复：正确处理大立即数 (包括负数) *)
 let handle_large_immediate state reg n =
-  (reg, [Li (reg, n)], {state with temp_counter = state.temp_counter + 1})
+  if n >= -2048 && n <= 2047 then
+    (* 小立即数直接使用 addi *)
+    (reg, [Addi (reg, RiscvReg "zero", n)], {state with temp_counter = state.temp_counter + 1})
+  else
+    (* 大立即数需要拆分为lui + addi *)
+    let adjusted_n = if n < 0 then n + 0x1000_0000 else n in
+    let high_bits = (adjusted_n asr 12) in
+    let low_bits = adjusted_n - (high_bits lsl 12) in
+    let (temp, state1) = fresh_temp state in
+    (reg, [
+        Lui (reg, high_bits);   (* 加载高20位 *)
+        Addi (reg, reg, low_bits)   (* 添加低12位 *)
+      ], {state1 with temp_counter = state.temp_counter + 2})
 
 (* ==================== 优化后的表达式转换 ==================== *)
 let rec expr_to_ir state expr =
@@ -147,7 +160,7 @@ let rec stmt_to_ir state stmt =
   | BlockStmt b -> block_to_ir state b
   
   | DeclStmt (_, name, Some expr) ->
-      let (expr_reg, expr_code, state') = expr极飞_ir state expr in
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
   
@@ -269,49 +282,41 @@ let () =
     output_string oc (Printf.sprintf "%s:\n" func.name);
     
     List.iter (fun instr ->
+      let reg_to_str = function
+        | RiscvReg s -> s
+        | Temp i -> "t" ^ string_of_int i
+      in
+      
       let instr_str = match instr with
-        | Li (r, n) -> 
-            (* 直接输出addi指令，包括大立即数 *)
-            Printf.sprintf "  addi %s, zero, %d"
-              (match r with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              n
-        
+        | Addi (rd, rs, n) ->
+            Printf.sprintf "  addi %s, %s, %d" (reg_to_str rd) (reg_to_str rs) n
+            
+        | Lui (rd, n) ->
+            Printf.sprintf "  lui %s, %%hi(%d)" (reg_to_str rd) n
+            
         | Mv (rd, rs) -> 
-            (* 使用addi代替mv指令 *)
-            Printf.sprintf "  addi %s, %s, 0"
-              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-        
+            Printf.sprintf "  addi %s, %s, 0" (reg_to_str rd) (reg_to_str rs)
+            
         | BinaryOp (op, rd, rs1, rs2) -> 
             Printf.sprintf "  %s %s, %s, %s" op
-              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match rs1 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match rs2 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-        
+              (reg_to_str rd) (reg_to_str rs1) (reg_to_str rs2)
+            
         | Branch (cond, rs1, rs2, label) -> 
             Printf.sprintf "  %s %s, %s, %s" cond
-              (match rs1 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              (match rs2 with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              label
-        
+              (reg_to_str rs1) (reg_to_str rs2) label
+            
         | Jmp label -> "  j " ^ label
         | Label label -> label ^ ":"
         | Call func -> "  call " ^ func
         | Ret -> "  ret"
         
         | Store (rs, base, off) -> 
-            (* 直接输出sd指令，包括大偏移量 *)
             Printf.sprintf "  sd %s, %d(%s)"
-              (match rs with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              off
-              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (reg_to_str rs) off (reg_to_str base)
         
         | Load (rd, base, off) -> 
-            (* 直接输出ld指令，包括大偏移量 *)
             Printf.sprintf "  ld %s, %d(%s)"
-              (match rd with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
-              off
-              (match base with RiscvReg s -> s | Temp i -> "t" ^ string_of_int i)
+              (reg_to_str rd) off (reg_to_str base)
       in
       output_string oc (instr_str ^ "\n")
     ) func.body;
