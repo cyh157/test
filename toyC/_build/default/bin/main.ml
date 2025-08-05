@@ -643,8 +643,8 @@ module LivenessAnalysis = struct
   let regs_defined = function
     | Li (rd, _) -> RegSet.singleton rd
     | Mv (rd, _) -> RegSet.singleton rd
-    | BinaryOp (rd, _, _, _) -> RegSet.singleton (RiscvReg rd)
-    | BinaryOpImm (rd, _, _, _) -> RegSet.singleton (RiscvReg rd)
+    | BinaryOp (op, rd, rs1, rs2) -> RegSet.singleton rd
+    | BinaryOpImm (op, rd, rs, imm) -> RegSet.singleton rd
     | Load (rd, _, _) -> RegSet.singleton rd
     | ReloadVar (rd, _) -> RegSet.singleton rd
     | Call _ -> RegSet.singleton (RiscvReg "a0") (* 函数返回值 *)
@@ -732,13 +732,22 @@ module IRToRiscV = struct
         else
           (* 对于分配到栈的Temp寄存器，使用临时硬件寄存器t0 *)
           "t0"
+  
+  (* 辅助函数：将带立即数的指令 op_imm 转换为普通二元运算 op *)
+  let op_to_rr_op = function
+    | "addi" -> "add"
+    | "xori" -> "xor"
+    | "ori" -> "or"
+    | "andi" -> "and"
+    | "slti" -> "slt"
+    | _ -> failwith "Unsupported immediate operation"
 
   (* 辅助函数：将一个大立即数加载到寄存器中 *)
   let load_large_imm dest_reg imm =
     let lower_12 = imm land 0xFFF in
     let upper_20 = (imm lsr 12) in
     let adjusted_upper = if (lower_12 lsr 11) = 1 then upper_20 + 1 else upper_20 in
-    Printf.sprintf "lui %s, %d\n  addi %s, %s, %d" dest_reg adjusted_upper dest_reg dest_reg lower_12
+    Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" dest_reg adjusted_upper dest_reg dest_reg lower_12
 
   (* 修改instr_to_asm函数以处理栈访问 *)
   let instr_to_asm var_offsets frame_size instrs =
@@ -788,34 +797,33 @@ module IRToRiscV = struct
                 pre_code ^ main_code ^ post_code
 
             | BinaryOpImm (op, rd, rs, imm) ->
-                if is_stack_temp rd then
-                    if is_stack_temp rs then
+                if imm >= -2048 && imm <= 2047 then
+                    if is_stack_temp rd then
                         let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
-                        let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
-                        let pre_code = Printf.sprintf "  lw t0, %d(s0)\n  lw t1, %d(s0)\n" rs_offset rd_offset in
-                        let main_code = Printf.sprintf "  %s t0, t0, %d" op imm in
-                        let post_code = Printf.sprintf "\n  sw t0, %d(s0)" rd_offset in
+                        let rs_reg = if is_stack_temp rs then "t0" else reg_map rs in
+                        let pre_code = if is_stack_temp rs then Printf.sprintf "  lw t0, %s\n" (reg_map rs) else "" in
+                        let main_code = Printf.sprintf "  %s t1, %s, %d" op rs_reg imm in
+                        let post_code = Printf.sprintf "\n  sw t1, %s" (reg_map rd) in
                         pre_code ^ main_code ^ post_code
+                    else if is_stack_temp rs then
+                         let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
+                         let rd_reg = reg_map rd in
+                         let pre_code = Printf.sprintf "  lw t0, %s\n" (reg_map rs) in
+                         let main_code = Printf.sprintf "  %s %s, t0, %d" op rd_reg imm in
+                         pre_code ^ main_code
                     else
-                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
-                        let rs_reg = reg_map rs in
-                        let pre_code = "" in
-                        let main_code = Printf.sprintf "  %s t0, %s, %d" op rs_reg imm in
-                        let post_code = Printf.sprintf "\n  sw t0, %d(s0)" rd_offset in
-                        pre_code ^ main_code ^ post_code
-                else if is_stack_temp rs then
-                    let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
-                    let rd_reg = reg_map rd in
-                    let pre_code = Printf.sprintf "  lw t0, %d(s0)\n" rs_offset in
-                    let main_code = Printf.sprintf "  %s %s, t0, %d" op rd_reg imm in
-                    pre_code ^ main_code
+                         Printf.sprintf "  %s %s, %s, %d" op (reg_map rd) (reg_map rs) imm
                 else
-                    if imm >= -2048 && imm <= 2047 then
-                      Printf.sprintf "  %s %s, %s, %d" op (reg_map rd) (reg_map rs) imm
-                    else
-                      let temp_reg = "t0" in
-                      Printf.sprintf "  %s\n  %s %s, %s, %s" (load_large_imm temp_reg imm) op (reg_map rd) (reg_map rs) temp_reg
-
+                    let rd_reg = reg_map_to_reg rd in
+                    let rs_reg = reg_map_to_reg rs in
+                    let temp_reg = "t0" in
+                    let pre_code =
+                      (if is_stack_temp rs then Printf.sprintf "  lw %s, %s\n" rs_reg (reg_map rs) else "") in
+                    let post_code =
+                      (if is_stack_temp rd then Printf.sprintf "\n  sw %s, %s" rd_reg (reg_map rd) else "") in
+                    pre_code ^ (Printf.sprintf "  li %s, %d\n  %s %s, %s, %s%s"
+                    temp_reg imm (op_to_rr_op op) rd_reg rs_reg temp_reg) ^ post_code
+            
             | Branch (op, r1, r2, label) ->
                 if is_stack_temp r1 || is_stack_temp r2 then
                     let r1_reg = if is_stack_temp r1 then "t0" else reg_map r1 in
