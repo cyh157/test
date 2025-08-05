@@ -597,6 +597,7 @@ and block_to_ir state block =
   (code, exited_state)
 
 (* 修改 func_to_ir 函数 *)
+(* 修改 func_to_ir 函数 *)
 let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { initial_state with var_offset = Hashtbl.create (List.length func.params);
   stack_size = 0; label_counter = 0; current_function = func.name; (* 设置当前函数名 *) } in
@@ -619,6 +620,7 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   }, final_state.var_offset
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
+(* 在 IRToRiscV 模块内替换现有的 LivenessAnalysis 模块 *)
 module LivenessAnalysis = struct
   module RegSet = Set.Make(struct type t = reg let compare = compare end)
 
@@ -741,11 +743,12 @@ module IRToRiscV = struct
     | _ -> failwith "Unsupported immediate operation"
 
   (* 辅助函数：将一个大立即数加载到寄存器中 *)
-  let load_large_imm dest_reg imm =
-    let lower_12 = imm land 0xFFF in
-    let upper_20 = (imm lsr 12) in
-    let adjusted_upper = if (lower_12 lsr 11) = 1 then upper_20 + 1 else upper_20 in
-    Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" dest_reg adjusted_upper dest_reg dest_reg lower_12
+   let load_large_imm dest_reg imm =
+    let signed_lower = imm land 0xFFF in
+    let upper_20 = (imm asr 12) land 0xFFFFF in
+    let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
+    let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
+    Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" dest_reg adjusted_upper dest_reg dest_reg signed_lower
 
   (* 修改instr_to_asm函数以处理栈访问 *)
   let instr_to_asm var_offsets frame_size instrs =
@@ -775,7 +778,7 @@ module IRToRiscV = struct
                         let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
                         Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" rs_offset rd_offset
                     else
-                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 4) * 4) in
+                        let rd_offset = -(68 + (match rd with Temp n -> n-15 | _ -> 0) * 4) in
                         Printf.sprintf "  sw %s, %d(s0)" (reg_map rs) rd_offset
                 else if is_stack_temp rs then
                     let rs_offset = -(68 + (match rs with Temp n -> n-15 | _ -> 0) * 4) in
@@ -819,8 +822,8 @@ module IRToRiscV = struct
                       (if is_stack_temp rs then Printf.sprintf "  lw %s, %s\n" rs_reg (reg_map rs) else "") in
                     let post_code =
                       (if is_stack_temp rd then Printf.sprintf "\n  sw %s, %s" rd_reg (reg_map rd) else "") in
-                    pre_code ^ (Printf.sprintf "%s\n  %s %s, %s, %s%s"
-                    (load_large_imm temp_reg imm) (op_to_rr_op op) rd_reg rs_reg temp_reg) ^ post_code
+                    pre_code ^ (Printf.sprintf "  li %s, %d\n  %s %s, %s, %s%s"
+                    temp_reg imm (op_to_rr_op op) rd_reg rs_reg temp_reg) ^ post_code
             
             | Branch (op, r1, r2, label) ->
                 if is_stack_temp r1 || is_stack_temp r2 then
