@@ -819,13 +819,25 @@ let instr_to_asm var_offsets frame_size instrs =
                         let stack_offset = -(8 + (m - 15 + 1) * 4) in
                         Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                     | _ -> ""))
-         | BinaryOpImm (op, rd, rs, imm) ->
-    (* 处理超出范围的立即数 *)
+    | BinaryOpImm (op, rd, rs, imm) ->
+    (* 正确处理指令名映射 *)
+    let base_op = match op with
+        | "addi" -> "add"
+        | "subi" -> "sub"  (* 注意：subi在RISC-V中也是用addi实现 *)
+        | "xori" -> "xor"
+        | "ori"  -> "or"
+        | "andi" -> "and"
+        | "slti" -> "slt"
+        | "sltiu" -> "sltu"
+        | _ -> String.sub op 0 (String.length op - 1) 
+    in
+    
+    (* 检查立即数是否超出范围 *)
     if imm < -2048 || imm > 2047 then
         let imm_temp = "t3" in (* 使用 t3 临时寄存器 *)
         Printf.sprintf "  li %s, %d\n" imm_temp imm ^
         Printf.sprintf "  %s %s, %s, %s" 
-            (String.sub op 0 (String.length op - 1)) (* 移除"i"后缀 *)
+            base_op
             (reg_map var_offsets frame_size rd)
             (reg_map var_offsets frame_size rs)
             imm_temp
