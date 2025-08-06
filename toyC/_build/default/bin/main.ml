@@ -56,12 +56,8 @@ let initial_state = {
 
 (* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
-  match state.free_temps with
-  | temp :: rest -> 
-      (Temp temp, {state with free_temps = rest})
-  | [] -> 
-      let temp = state.temp_counter in
-      (Temp temp, {state with temp_counter = temp + 1})
+  let temp = state.temp_counter in
+  (Temp temp, {state with temp_counter = temp + 1})
 
 (* 释放临时寄存器以便重用 *)
 let free_temp state temp_reg = 
@@ -338,42 +334,31 @@ let rec expr_to_ir state expr =
       let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
-  (* 修复后的Call分支 - 参数处理逻辑 *)
+  (* 修复后的Call分支 *)
   | Call (name, args) ->
     (* 参数个数 *)
     let arg_count = List.length args in
-    let max_reg_params = 8 in
-    let reg_param_count = min arg_count max_reg_params in
-    let stack_param_count = max (arg_count - max_reg_params) 0 in
     
-    (* 处理寄存器参数 *)
-    let (reg_args, state') = 
+    (* 处理参数 *)
+    let (arg_code, state') = 
       List.fold_left (fun (code_acc, st) i ->
         let arg = List.nth args i in
-        let (reg, arg_code, st') = expr_to_ir st arg in
-        let code = 
-          code_acc @ 
-          arg_code @ 
-          [Mv (RiscvReg ("a" ^ string_of_int i), reg)] in
-        (code, st')
-      ) ([], state) (List.init reg_param_count Fun.id) in
-    
-    (* 处理栈参数 *)
-    let (stack_args, state'') = 
-      List.fold_left (fun (code_acc, st) i ->
-        let index = i + reg_param_count in
-        let arg = List.nth args index in
-        let (reg, arg_code, st') = expr_to_ir st arg in
-        let stack_offset = i * 4 in
-        let code = 
-          code_acc @ 
-          arg_code @ 
-          [Store (reg, RiscvReg "sp", stack_offset)] in
-        (code, st')
-      ) ([], state') (List.init stack_param_count Fun.id) in
+        let (arg_reg, arg_code, st') = expr_to_ir st arg in
+        let new_code = 
+          if i < 8 then
+            (* 前8个参数移动到参数寄存器 *)
+            arg_code @ [Mv (RiscvReg ("a" ^ string_of_int i), arg_reg)]
+          else
+            (* 额外参数存储在栈上 *)
+            let stack_offset = (i - 8) * 4 in
+            arg_code @ [Store (arg_reg, RiscvReg "sp", stack_offset)]
+        in
+        (code_acc @ new_code, free_temp st' arg_reg)
+      ) ([], state) (List.init arg_count Fun.id)
+    in
     
     (* 函数调用和获取结果 *)
-    let (result_reg, state''') = fresh_temp state'' in
+    let (result_reg, state'') = fresh_temp state' in
     let is_void_func = 
       try
         let func_info = Hashtbl.find func_table name in
@@ -384,7 +369,7 @@ let rec expr_to_ir state expr =
       [Call name] @ 
       (if not is_void_func then [Mv (result_reg, RiscvReg "a0")] else []) in
     
-    (result_reg, reg_args @ stack_args @ call_code, state''')
+    (result_reg, arg_code @ call_code, state'')
 
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
@@ -739,20 +724,20 @@ module IRToRiscV = struct
 
   (* 加载立即数的辅助函数 - 处理大立即数 *)
   let load_immediate reg_str imm =
-  if imm >= -2048 && imm <= 2047 then
-    Printf.sprintf "  addi %s, zero, %d" reg_str imm
-  else
-    let upper = imm asr 12 in
-    let lower = imm land 0xFFF in
-    (* 如果低12位是负数，需要调整 *)
-    let (upper, lower) = 
-      if lower >= 2048 then (upper + 1, lower - 4096)
-      else (upper, lower)
-    in
-    if upper <> 0 then
-      Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" reg_str upper reg_str reg_str lower
+    if imm >= -2048 && imm <= 2047 then
+      Printf.sprintf "  addi %s, zero, %d" reg_str imm
     else
-      Printf.sprintf "  addi %s, zero, %d" reg_str lower
+      let upper = imm asr 12 in
+      let lower = imm land 0xFFF in
+      (* 如果低12位是负数，需要调整 *)
+      let (upper, lower) = 
+        if lower >= 2048 then (upper + 1, lower - 4096)
+        else (upper, lower)
+      in
+      if upper <> 0 then
+        Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" reg_str upper reg_str reg_str lower
+      else
+        Printf.sprintf "  addi %s, zero, %d" reg_str lower
       
   (* 修复后的instr_to_asm函数 *)
   let instr_to_asm var_offsets frame_size instrs =
@@ -954,7 +939,7 @@ module IRToRiscV = struct
     Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
     Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
     Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
-    Printf.sprintf "  addi s0, sp, %d\n" frame_size
+    Printf.sprintf "  mv s0, sp\n" (* 修正：使用mv而不是addi *)
 
   (* 函数尾声 *)
   let function_epilogue frame_size =
