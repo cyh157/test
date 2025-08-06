@@ -753,9 +753,7 @@ let instr_to_asm var_offsets frame_size instrs =
                     | Li (r, n) -> 
               (* 处理立即数值的辅助函数 *)
               let process_imm_value n =
-                if n = 0 then
-                  "zero"
-                else if n >= -2048 && n <= 2047 then
+               if n >= -2048 && n <= 2047 then
                   string_of_int n
                 else
                   (* 正确处理大立即数（包括负数） *)
@@ -845,21 +843,49 @@ let instr_to_asm var_offsets frame_size instrs =
                         let stack_offset = -(8 + (m - 15 + 1) * 4) in
                         Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                     | _ -> ""))
-                    | BinaryOpImm (op, rd, rs, imm) ->
+                     | BinaryOpImm (op, rd, rs, imm) ->
               (* 处理立即数值的辅助函数 *)
               let process_imm_value n =
-                if n = 0 then
-                  "zero"
-                else if n >= -2048 && n <= 2047 then
-                  string_of_int n
-                else
-                  (* 正确处理大立即数（包括负数） *)
-                  let hi = (n asr 12) + (if n land 0x800 != 0 then 1 else 0) in
-                  let lo = n - (hi lsl 12) in
-                  Printf.sprintf "t1\n  lui t1, %d\n  addi t1, t1, %d" hi lo
+    if n >= -2048 && n <= 2047 then
+    string_of_int n
+  else
+    (* 正确分割立即数为 hi 和 lo *)
+    let hi = (n + 0x800) asr 12 in
+    let lo = n - (hi lsl 12) in
+    
+    (* 将 hi 转换为无符号表示 *)
+    let unsigned_hi = 
+      if hi < 0 then
+        hi + (1 lsl 20)  (* 转换为无符号 *)
+      else
+        hi
+    in
+    
+    (* 确保 lo 在范围内 *)
+    assert (lo >= -2048 && lo <= 2047);
+    (* 确保 unsigned_hi 在范围内 *)
+    assert (unsigned_hi >= 0 && unsigned_hi <= 1048575);
+    
+    Printf.sprintf "  lui t1, %d\n  addi t1, t1, %d" unsigned_hi lo
               in
               
               let imm_str = process_imm_value imm in
+              
+              (* 根据立即数大小选择合适的操作符 *)
+              let actual_op = 
+                if String.contains imm_str '\n' then
+                  (* 大立即数 - 使用寄存器版本的操作符 *)
+                  match op with
+                  | "addi" -> "add"
+                  | "sub" -> "sub"  (* sub 没有立即数版本 *)
+                  | "andi" -> "and"
+                  | "ori" -> "or"
+                  | "xori" -> "xor"
+                  | _ -> op
+                else
+                  (* 小立即数 - 保持原操作符 *)
+                  op
+              in
               
               (match (rd, rs) with
               | (Temp n, _) when n >= 15 -> 
@@ -876,10 +902,10 @@ let instr_to_asm var_offsets frame_size instrs =
                   if String.contains imm_str '\n' then
                     (* 大立即数需要多条指令 *)
                     load ^ imm_str ^ 
-                    Printf.sprintf "\n  %s t0, t2, t1\n  sw t0, %d(s0)" op stack_offset
+                    Printf.sprintf "\n  %s t0, t2, t1\n  sw t0, %d(s0)" actual_op stack_offset
                   else
                     load ^ 
-                    Printf.sprintf "  %s t0, t2, %s\n  sw t0, %d(s0)" op imm_str stack_offset
+                    Printf.sprintf "  %s t0, t2, %s\n  sw t0, %d(s0)" actual_op imm_str stack_offset
               | _ -> 
                   let dest = reg_map var_offsets frame_size rd in
                   let (reg, load) = 
@@ -898,9 +924,9 @@ let instr_to_asm var_offsets frame_size instrs =
                   if String.contains imm_str '\n' then
                     (* 大立即数需要多条指令 *)
                     load ^ imm_str ^ 
-                    Printf.sprintf "\n  %s %s, %s, t1" op dest_reg reg
+                    Printf.sprintf "\n  %s %s, %s, t1" actual_op dest_reg reg
                   else
-                    load ^ Printf.sprintf "  %s %s, %s, %s" op dest_reg reg imm_str)
+                    load ^ Printf.sprintf "  %s %s, %s, %s" actual_op dest_reg reg imm_str)
           | Branch (cond, rs1, rs2, label) ->
               let (reg1, load1) = 
                 match rs1 with
