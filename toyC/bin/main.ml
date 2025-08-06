@@ -1,4 +1,3 @@
-
 exception LexicalError of string [@@warning "-38"]
 exception SemanticError of string
 
@@ -25,6 +24,7 @@ type ir_instr =
   | Store of reg * reg * int       (* 存储到内存 *)
   | Load of reg * reg * int        (* 从内存加载 *)
   | ReloadVar of reg * string      (* 在函数调用后重新加载变量 *)
+
 type ir_func = {
   name: string;
   params: string list;
@@ -584,6 +584,15 @@ module IRToRiscV = struct
         let stack_offset = -(68 + (n - Array.length reg_names) * 4) in
         Printf.sprintf "%d(s0)" stack_offset
 
+  (* 拆分32位整数为高位（20位）和低位（12位），适应RISC-V立即数范围 *)
+  let split_large_immediate n =
+    let lower = n land 0xFFF in  (* 取低12位 *)
+    let upper = (n lsr 12) land 0xFFFFF in  (* 取高20位 *)
+    (* 处理负数的补码调整（如果低12位最高位为1，高位加1） *)
+    let upper = if lower >= 0x800 then upper + 1 else upper in
+    let adjusted_lower = if lower >= 0x800 then lower - 0x1000 else lower in
+    (upper, adjusted_lower)
+
   let calculate_frame_size (ir_func : ir_func) =
     let base_size = 16 in
     let rec analyze_instrs = function
@@ -613,7 +622,18 @@ module IRToRiscV = struct
             | Temp n when n >= Array.length reg_names -> 
                 let offset = -(68 + (n - Array.length reg_names) * 4) in
                 let temp_reg = "t0" in
-                ([Printf.sprintf "  lw %s, %d(s0)" temp_reg offset], temp_reg)
+                let code = 
+                  if offset >= -2048 && offset <= 2047 then
+                    [Printf.sprintf "  lw %s, %d(s0)" temp_reg offset]
+                  else
+                    let (upper, lower) = split_large_immediate offset in
+                    [
+                      Printf.sprintf "  lui %s, %d" temp_reg upper;
+                      Printf.sprintf "  addi %s, %s, %d" temp_reg temp_reg lower;
+                      Printf.sprintf "  add %s, %s, s0" temp_reg temp_reg
+                    ]
+                in
+                (code, temp_reg)
             | _ -> ([], reg_map r)
           in
           
@@ -621,7 +641,16 @@ module IRToRiscV = struct
             match r with
             | Temp n when n >= Array.length reg_names -> 
                 let offset = -(68 + (n - Array.length reg_names) * 4) in
-                [Printf.sprintf "  sw %s, %d(s0)" value_reg offset]
+                if offset >= -2048 && offset <= 2047 then
+                  [Printf.sprintf "  sw %s, %d(s0)" value_reg offset]
+                else
+                  let (upper, lower) = split_large_immediate offset in
+                  [
+                    Printf.sprintf "  lui t0, %d" upper;
+                    Printf.sprintf "  addi t0, t0, %d" lower;
+                    Printf.sprintf "  add t0, t0, s0";
+                    Printf.sprintf "  sw %s, 0(t0)" value_reg
+                  ]
             | _ -> []
           in
           
@@ -632,13 +661,10 @@ module IRToRiscV = struct
                 if n >= -2048 && n <= 2047 then
                   (pre, [], [Printf.sprintf "  addi %s, x0, %d" rd n])
                 else
-                  let signed_lower = n land 0xFFF in
-                  let upper_20 = (n asr 12) land 0xFFFFF in
-                  let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
-                  let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
+                  let (upper, lower) = split_large_immediate n in
                   (pre, [], [
-                    Printf.sprintf "  lui %s, %d" rd adjusted_upper;
-                    Printf.sprintf "  addi %s, %s, %d" rd rd signed_lower
+                    Printf.sprintf "  lui %s, %d" rd upper;
+                    Printf.sprintf "  addi %s, %s, %d" rd rd lower
                   ])
                      
             | Mv (rd, rs) ->
@@ -664,14 +690,11 @@ module IRToRiscV = struct
                        (pre_rs @ pre_rd, post, [Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm])
                      else
                        let temp_reg = "t0" in
-                       let signed_lower = imm land 0xFFF in
-                       let upper_20 = (imm asr 12) land 0xFFFFF in
-                       let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
-                       let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
+                       let (upper, lower) = split_large_immediate imm in
                        (pre_rs @ pre_rd, post, [
-                         Printf.sprintf "  lui %s, %d" temp_reg adjusted_upper;
-                         Printf.sprintf "  addi %s, %s, %d" temp_reg temp_reg signed_lower;
-                         Printf.sprintf "  %s %s, %s, %s" op rd_reg rs_reg temp_reg
+                         Printf.sprintf "  lui %s, %d" temp_reg upper;
+                         Printf.sprintf "  addi %s, %s, %d" temp_reg temp_reg lower;
+                         Printf.sprintf "  add %s, %s, %s" rd_reg rs_reg temp_reg
                        ])
                  | _ -> 
                      (pre_rs @ pre_rd, post, [Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm]))
@@ -699,29 +722,55 @@ module IRToRiscV = struct
             | Store (rs, base, offset) ->
                 let (pre_rs, rs_reg) = handle_reg rs in
                 let (pre_base, base_reg) = handle_reg base in
-                (pre_rs @ pre_base, [], [Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg])
+                if offset >= -2048 && offset <= 2047 then
+                  (pre_rs @ pre_base, [], [Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg])
+                else
+                  let (upper, lower) = split_large_immediate offset in
+                  let code = [
+                    Printf.sprintf "  lui t0, %d" upper;
+                    Printf.sprintf "  addi t0, t0, %d" lower;
+                    Printf.sprintf "  add t0, t0, %s" base_reg;
+                    Printf.sprintf "  sw %s, 0(t0)" rs_reg
+                  ] in
+                  (pre_rs @ pre_base, [], code)
                 
             | Load (rd, base, offset) ->
                 let (pre_base, base_reg) = handle_reg base in
                 let (pre_rd, rd_reg) = handle_reg rd in
                 let post = handle_store_reg rd rd_reg in
-                (pre_base @ pre_rd, post, [Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg])
+                if offset >= -2048 && offset <= 2047 then
+                  (pre_base @ pre_rd, post, [Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg])
+                else
+                  let (upper, lower) = split_large_immediate offset in
+                  let code = [
+                    Printf.sprintf "  lui t0, %d" upper;
+                    Printf.sprintf "  addi t0, t0, %d" lower;
+                    Printf.sprintf "  add t0, t0, %s" base_reg;
+                    Printf.sprintf "  lw %s, 0(t0)" rd_reg
+                  ] in
+                  (pre_base @ pre_rd, post, code)
                 
             | ReloadVar (rd, var_name) ->
                 try
                   let offset = Hashtbl.find var_offsets var_name in
                   let (pre_rd, rd_reg) = handle_reg rd in
                   let post = handle_store_reg rd rd_reg in
-                  (pre_rd, post, [Printf.sprintf "  lw %s, %d(s0)" rd_reg offset])
+                  if offset >= -2048 && offset <= 2047 then
+                    (pre_rd, post, [Printf.sprintf "  lw %s, %d(s0)" rd_reg offset])
+                  else
+                    let (upper, lower) = split_large_immediate offset in
+                    let code = [
+                      Printf.sprintf "  lui t0, %d" upper;
+                      Printf.sprintf "  addi t0, t0, %d" lower;
+                      Printf.sprintf "  add t0, t0, s0";
+                      Printf.sprintf "  lw %s, 0(t0)" rd_reg
+                    ] in
+                    (pre_rd, post, code)
                 with Not_found ->
                   failwith ("Variable " ^ var_name ^ " not found during code generation")
           in
           
-          let full_code = 
-            (List.map (fun s -> s) pre_code) @ 
-            asm_lines @ 
-            (List.map (fun s -> s) post_code)
-          in
+          let full_code = pre_code @ asm_lines @ post_code in
           convert_instrs (acc_index + 1) ((List.rev full_code) @ acc_code) rest
     in
     convert_instrs 0 [] instrs
@@ -729,36 +778,97 @@ module IRToRiscV = struct
   let save_callee_saved frame_size =
     let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
     List.mapi (fun i reg ->
-      Printf.sprintf "  sw %s, %d(sp)\n" reg (frame_size - 12 - i * 4)
+      let offset = frame_size - 12 - i * 4 in
+      if offset >= -2048 && offset <= 2047 then
+        Printf.sprintf "  sw %s, %d(sp)" reg offset
+      else
+        let (upper, lower) = split_large_immediate offset in
+        Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  sw %s, 0(t0)" 
+          upper lower reg
     ) s_regs
-    |> String.concat ""
+    |> String.concat "\n"
 
   let restore_callee_saved frame_size =
     let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
     List.mapi (fun i reg ->
-      Printf.sprintf "  lw %s, %d(sp)\n" reg (frame_size - 12 - i * 4)
+      let offset = frame_size - 12 - i * 4 in
+      if offset >= -2048 && offset <= 2047 then
+        Printf.sprintf "  lw %s, %d(sp)" reg offset
+      else
+        let (upper, lower) = split_large_immediate offset in
+        Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  lw %s, 0(t0)" 
+          upper lower reg
     ) s_regs
-    |> String.concat ""
+    |> String.concat "\n"
 
   let function_prologue name frame_size =
     let ra_offset = frame_size - 4 in
     let s0_offset = frame_size - 8 in
     let save_code = save_callee_saved frame_size in
+    
+    (* 生成调整栈指针的指令（处理大frame_size） *)
+    let sp_adjust = 
+      if frame_size <= 2047 then
+        [Printf.sprintf "  addi sp, sp, -%d" frame_size]
+      else
+        let n = -frame_size in  (* 需要减去的栈大小，转为负数 *)
+        let (upper, lower) = split_large_immediate n in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          "  add sp, sp, t0"  (* 用add组合高位和低位，避免直接用addi *)
+        ]
+    in
+    
     Printf.sprintf "%s:\n" name ^
-    Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
-    Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
-    Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
+    String.concat "\n" sp_adjust ^ "\n" ^
+    (if ra_offset >= -2048 && ra_offset <= 2047 then
+       Printf.sprintf "  sw ra, %d(sp)\n" ra_offset
+     else
+       let (upper, lower) = split_large_immediate ra_offset in
+       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  sw ra, 0(t0)\n" 
+         upper lower) ^
+    (if s0_offset >= -2048 && s0_offset <= 2047 then
+       Printf.sprintf "  sw s0, %d(sp)\n" s0_offset
+     else
+       let (upper, lower) = split_large_immediate s0_offset in
+       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  sw s0, 0(t0)\n" 
+         upper lower) ^
     save_code ^
-    Printf.sprintf "  addi s0, sp, %d\n" frame_size
+    (if frame_size >= -2048 && frame_size <= 2047 then
+       Printf.sprintf "  addi s0, sp, %d\n" frame_size
+     else
+       let (upper, lower) = split_large_immediate frame_size in
+       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add s0, sp, t0\n" 
+         upper lower)
 
   let function_epilogue frame_size =
     let ra_offset = frame_size - 4 in 
     let s0_offset = frame_size - 8 in 
     let restore_code = restore_callee_saved frame_size in
+    
     restore_code ^
-    Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
-    Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
-    Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
+    (if ra_offset >= -2048 && ra_offset <= 2047 then
+       Printf.sprintf "  lw ra, %d(sp)\n" ra_offset
+     else
+       let (upper, lower) = split_large_immediate ra_offset in
+       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  lw ra, 0(t0)\n" 
+         upper lower) ^
+    (if s0_offset >= -2048 && s0_offset <= 2047 then
+       Printf.sprintf "  lw s0, %d(sp)\n" s0_offset
+     else
+       let (upper, lower) = split_large_immediate s0_offset in
+       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  lw s0, 0(t0)\n" 
+         upper lower) ^
+    (if frame_size <= 2047 then
+       Printf.sprintf "  addi sp, sp, %d\n" frame_size
+     else
+       let (upper, lower) = split_large_immediate frame_size in
+       [
+         Printf.sprintf "  lui t0, %d" upper;
+         Printf.sprintf "  addi t0, t0, %d" lower;
+         "  add sp, sp, t0"
+       ] |> String.concat "\n") ^
     "  jalr x0, ra, 0\n"
 
   let func_to_asm var_offsets (ir_func : ir_func) =
@@ -768,12 +878,34 @@ module IRToRiscV = struct
     
     List.iteri (fun i param ->
       let offset = -(68 + i * 4) in
-      if i < 8 then
-        Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
-      else
+      if i < 8 then (
+        if offset >= -2048 && offset <= 2047 then
+          Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
+        else
+          let (upper, lower) = split_large_immediate offset in
+          Buffer.add_string buf (
+            Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, s0\n  sw a%d, 0(t0)\n" 
+              upper lower i
+          )
+      ) else
         let param_stack_offset = (i - 8) * 4 in
-        Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n" param_stack_offset);
-        Buffer.add_string buf (Printf.sprintf "  sw t0, %d(s0)\n" offset)
+        if param_stack_offset >= -2048 && param_stack_offset <= 2047 then
+          Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n" param_stack_offset)
+        else
+          let (upper, lower) = split_large_immediate param_stack_offset in
+          Buffer.add_string buf (
+            Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, s0\n  lw t0, 0(t0)\n" 
+              upper lower
+          );
+          
+        if offset >= -2048 && offset <= 2047 then
+          Buffer.add_string buf (Printf.sprintf "  sw t0, %d(s0)\n" offset)
+        else
+          let (upper, lower) = split_large_immediate offset in
+          Buffer.add_string buf (
+            Printf.sprintf "  lui t1, %d\n  addi t1, t1, %d\n  add t1, t1, s0\n  sw t0, 0(t1)\n" 
+              upper lower
+          )
     ) ir_func.params;
     
     let asm_lines = instr_to_asm var_offsets frame_size ir_func.body in
