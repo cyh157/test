@@ -1,3 +1,5 @@
+(* 注意：这里是完整的修改后代码 *)
+
 exception LexicalError of string [@@warning "-38"]
 exception SemanticError of string
 
@@ -42,6 +44,7 @@ type codegen_state = {
   current_function: string; (* 当前函数名 *)
 }
 
+(* 修改 initial_state *)
 let initial_state = {
   temp_counter = 0;
   label_counter = 0;
@@ -50,7 +53,7 @@ let initial_state = {
   loop_labels = [];
   scope_stack = [];
   free_temps = [];
-  current_function = "";
+  current_function = ""; (* 初始为空字符串 *)
 }
 
 (* ==================== 辅助函数 ==================== *)
@@ -62,16 +65,20 @@ let fresh_temp state =
       let temp = state.temp_counter in
       (Temp temp, {state with temp_counter = temp + 1})
 
+(* 释放临时寄存器以便重用 *)
 let free_temp state temp_reg = 
   match temp_reg with
   | Temp n -> {state with free_temps = n :: state.free_temps}
-  | RiscvReg _ -> state
+  | RiscvReg _ -> state (* RISC-V寄存器不回收 *)
 
+(* 修改 fresh_label 函数，添加函数名前缀 *)
 let fresh_label state prefix =
   let label = Printf.sprintf "%s_%s%d" state.current_function prefix state.label_counter in
   (label, {state with label_counter = state.label_counter + 1})
 
+(* 修改 get_var_offset_for_use 函数 *)
 let get_var_offset_for_use state var =
+  (* 在作用域栈中查找变量，从当前作用域开始向外 *)
   let rec lookup scopes =
     match scopes with
     | [] -> None
@@ -81,26 +88,33 @@ let get_var_offset_for_use state var =
          with Not_found ->
            lookup remaining_scopes)
   in
+  
+  (* 只在作用域栈中查找，找不到就报错 *)
   match lookup state.scope_stack with
-  | Some offset -> (offset, state)
-  | None -> failwith ("Variable " ^ var ^ " not found in local scopes")
+  | Some offset -> 
+      (offset, state)
+  | None ->
+      failwith ("Variable " ^ var ^ " not found in local scopes")
 
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      let offset = -(500 + state.stack_size) in
+      let offset = -(500  + state.stack_size) in  (* 从-100开始，避免与参数冲突 *)
       Hashtbl.add current_scope var offset;
       let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
   | [] ->
+      (* 如果作用域栈为空，创建新的作用域 *)
       let new_scope = Hashtbl.create 10 in
-      let offset = -(500 + state.stack_size) in
+      let offset = -(500  + state.stack_size) in
       Hashtbl.add new_scope var offset;
       let new_state = {state with 
                        scope_stack = new_scope :: state.scope_stack;
                        stack_size = state.stack_size + 4} in
       (offset, new_state)
 
+
+(* 将表达式转换为字符串 *)
 let rec string_of_expr = function
   | Num n -> string_of_int n
   | Var s -> s
@@ -108,6 +122,7 @@ let rec string_of_expr = function
   | Unary (op, e) -> (match op with Plus -> "+" | Minus -> "-" | Not -> "!") ^ string_of_expr e
   | Binary (op, e1, e2) -> (match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Lt -> "<" | Gt -> ">" | Leq -> "<=" | Geq -> ">=" | Eq -> "==" | Neq -> "!=" | And -> "&&" | Or -> "||") ^ "(" ^ string_of_expr e1 ^ ", " ^ string_of_expr e2 ^ ")"
 
+(* 将语句转换为字符串 *)
 let rec string_of_stmt = function
   | BlockStmt b -> "Block(" ^ String.concat "; " (List.map string_of_stmt b.stmts) ^ ")"
   | EmptyStmt -> ";"
@@ -123,26 +138,30 @@ let rec string_of_stmt = function
   | ReturnStmt (Some e) -> "return " ^ string_of_expr e ^ ";"
   | ReturnStmt None -> "return;"
 
+(* 将函数定义转换为字符串 *)
 let string_of_func_def fd =
   (match fd.ret_type with Int -> "int" | Void -> "void") ^ " " ^ fd.name ^ "(" ^ String.concat ", " (List.map (fun p -> (match p.typ with Int -> "int" | Void -> "void") ^ " " ^ p.name) fd.params) ^ ")" ^ " {\n" ^ string_of_stmt (BlockStmt fd.body) ^ "\n}"
 
+(* 将 AST 转换为字符串 *)
 let string_of_ast ast =
   String.concat "\n" (List.map string_of_func_def ast)
 
+(* 辅助函数：检查函数是否在全局作用域 *)
 let is_global_scope = function
   | BlockStmt _ -> false
   | _ -> true
 
+(* 辅助函数：检查 return 语句覆盖所有路径 *)
 let rec check_return_coverage stmt =
   match stmt with
-  | BlockStmt b -> 
+  | BlockStmt b ->  (* 检查块中所有语句，直到找到返回或确定没有返回 *)
   let rec check_block stmts =
     match stmts with
     | [] -> false
     | s::rest ->
         if check_return_coverage s 
-        then true 
-        else check_block rest
+        then true  (* 当前语句返回，整个块返回 *)
+        else check_block rest  (* 继续检查后续语句 *)
   in
   check_block b.stmts
   | IfStmt (cond, then_stmt, Some else_stmt) ->
@@ -159,7 +178,7 @@ let rec check_return_coverage stmt =
     List.iter (fun (fd : Ast.func_def) ->
       Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
     ) ast
-
+  (*检查函数调用*)
   let rec check_expr_calls (expr : Ast.expr) =
     match expr with
     | Call (name, args) ->
@@ -169,17 +188,21 @@ let rec check_return_coverage stmt =
     | Unary (_, e) -> check_expr_calls e
     | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
     | _ -> ()
-
+(* 语义分析主函数 *)
 let semantic_analysis ast =
   collect_functions ast;
   let has_main = ref false in
+  (* Symbol table stack, initialized with global scope *)
   let scope_stack = ref [StringMap.empty] in
+  (* Enter a new scope *)
   let enter_scope () =
     scope_stack := StringMap.empty :: !scope_stack
   in
+  (* Exit the current scope *)
   let leave_scope () =
     scope_stack := List.tl !scope_stack
   in
+  (* Add a variable to the current scope *)
   let add_var name typ =
     match !scope_stack with
     | current :: rest ->
@@ -188,6 +211,7 @@ let semantic_analysis ast =
         scope_stack := StringMap.add name typ current :: rest
     | [] -> failwith "scope stack empty"
   in
+  (* Look up variable type *)
   let rec find_var name = function
     | [] -> None
     | scope :: rest ->
@@ -195,6 +219,7 @@ let semantic_analysis ast =
         | Some t -> Some t
         | None -> find_var name rest
   in
+  (* Infer expression type *)
   let rec infer_expr_type expr =
     match expr with
     | Num _ -> Int
@@ -223,10 +248,11 @@ let semantic_analysis ast =
           raise (SemanticError "binary operation only supports int types");
         Int
   in
+  (* Check statement types, variable declarations, uses, and function calls *)
   let rec check_stmt stmt expected_ret_type in_loop =
     match stmt with
     | DeclStmt (t, name, e_opt) ->
-        add_var name t;
+        add_var name t; (* Add variable to scope before checking expression *)
         (match e_opt with
          | Some e ->
              let expr_type = infer_expr_type e in
@@ -314,21 +340,29 @@ let rec expr_to_ir state expr =
       let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
+  (* 在 expr_to_ir 函数的 Call 分支中 *)
+
   | Call (name, args) ->
+    (* 使用索引处理参数 *)
     let indexed_args = List.mapi (fun i arg -> (i, arg)) args in
+    
+    (* 处理参数 *)
     let (processed_args, final_state) = List.fold_left (
       fun (acc_results, acc_state) (i, arg_expr) ->
         let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
         let process_code = 
           if i < 8 then
+            (* 前8个参数移动到参数寄存器 *)
             code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
           else
-             let stack_offset = ((i - 8) * 4) in
+             let stack_offset = ((i - 8) * 4) in (* 与被调用函数访问偏移量对应 *)
           code @ [Store (reg, RiscvReg "sp", stack_offset)]
         in
         let free_state = free_temp new_state reg in
         (acc_results @ process_code, free_state)
     ) ([], state) indexed_args in
+    
+    (* 调用函数 *)
     let is_void_func = 
       try
         let func_info = Hashtbl.find func_table name in
@@ -344,7 +378,7 @@ let rec expr_to_ir state expr =
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
       let (temp, state'') = fresh_temp state' in
-      let state''' = free_temp state'' e_reg in
+      let state''' = free_temp state'' e_reg in (* 释放输入寄存器 *)
       (match op with
        | Plus -> (e_reg, e_code, state')
        | Minus -> (temp, e_code @ [BinaryOp ("sub", temp, RiscvReg "zero", e_reg)], state''')
@@ -355,6 +389,7 @@ let rec expr_to_ir state expr =
                             BinaryOpImm ("xori", temp, ne_temp, 1)], state_final))
   | Binary (op, e1, e2) ->
       let (e1_reg, e1_code, state') = expr_to_ir state e1 in        
+      (* 在处理 e2 时，将 e1_reg 标记为不可重用 *)
       let protected_state = 
         match e1_reg with
         | Temp n -> {state' with free_temps = List.filter (fun x -> x <> n) state'.free_temps}
@@ -362,10 +397,11 @@ let rec expr_to_ir state expr =
       in
       let (e2_reg, e2_code, state'') = expr_to_ir protected_state e2 in
       let (temp, state''') = fresh_temp state'' in
-      let state_final = free_temp (free_temp state''' e1_reg) e2_reg in
+      let state_final = free_temp (free_temp state''' e1_reg) e2_reg in (* 释放输入寄存器 *)
     
         match op with
         | And -> 
+            (* 短路求值: 如果第一个表达式为假，则不计算第二个表达式 *)
             let (false_label, state_false) = fresh_label state''' "and_false" in
             let (merge_label, state_merge) = fresh_label state_false "and_merge" in
             let state_final = free_temp state_merge temp in
@@ -380,6 +416,7 @@ let rec expr_to_ir state expr =
               Label merge_label], 
             state_final)
         | Or -> 
+            (* 短路求值: 如果第一个表达式为真，则不计算第二个表达式 *)
             let (true_label, state_true) = fresh_label state''' "or_true" in
             let (merge_label, state_merge) = fresh_label state_true "or_merge" in
             let state_final = free_temp state_merge temp in
@@ -402,13 +439,16 @@ let rec expr_to_ir state expr =
           | _ -> 
               (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
         | Mul -> 
+            (* 检查e1和e2中是否有函数调用 *)
             let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
             let e2_has_call = List.exists (function Call _ -> true | _ -> false) e2_code in
             
             (match (e1, e2) with
             | (Var x1, _) when e2_has_call -> 
+                (* 如果左侧是变量，右侧包含函数调用 *)
                 (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
             | (_, Var x2) when e1_has_call -> 
+                (* 如果右侧是变量，左侧包含函数调用 *)
                 (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
             | _ -> 
                 (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final))
@@ -419,9 +459,11 @@ let rec expr_to_ir state expr =
         | Lt -> 
             (temp, e1_code @ e2_code @ [BinaryOp ("slt", temp, e1_reg, e2_reg)], state_final)
         | Gt -> 
+            (* a > b 转换为 b < a *)
             let code = e1_code @ e2_code @ [BinaryOp ("slt", temp, e2_reg, e1_reg)] in
             (temp, code, state_final)
         | Leq ->
+        (* a <= b 转换为 !(b < a) *)
         let (lt_temp, state'''') = fresh_temp state_final in
         let state_final' = free_temp state'''' lt_temp in
         let code = e1_code @ e2_code @
@@ -429,6 +471,7 @@ let rec expr_to_ir state expr =
           BinaryOpImm ("xori", temp, lt_temp, 1)] in
         (temp, code, state_final')
         | Geq ->
+            (* a >= b 转换为 !(a < b) *)
             let (lt_temp, state'''') = fresh_temp state_final in
             let state_final' = free_temp state'''' lt_temp in
             let code = e1_code @ e2_code @
@@ -436,6 +479,7 @@ let rec expr_to_ir state expr =
               BinaryOpImm ("xori", temp, lt_temp, 1)] in
             (temp, code, state_final')
         | Eq ->
+            (* a == b 转换为 (a ^ b) == 0 *)
             let (xor_temp, state'''') = fresh_temp state_final in
             let (sltu_temp, state''''') = fresh_temp state'''' in
             let state_final'' = free_temp (free_temp state''''' xor_temp) sltu_temp in
@@ -445,6 +489,7 @@ let rec expr_to_ir state expr =
               BinaryOpImm ("xori", temp, sltu_temp, 1)] in
             (temp, code, state_final'')
         | Neq ->
+            (* a != b 转换为 (a ^ b) != 0 *)
             let (xor_temp, state'''') = fresh_temp state_final in
             let (sltu_temp, state''''') = fresh_temp state'''' in
             let state_final'' = free_temp (free_temp state''''' xor_temp) sltu_temp in
@@ -459,24 +504,24 @@ let enter_scope state =
 
 let leave_scope state =
   match state.scope_stack with
-  | [] -> state
+  | [] -> state  (* 没有作用域可退出 *)
   | _ :: rest -> {state with scope_stack = rest}
 
 let rec stmt_to_ir state stmt =
   match stmt with
   | BlockStmt b -> block_to_ir state b
-  | DeclStmt (_, name, Some expr) ->
+  | DeclStmt (_, name, Some expr) -> (* 带初始化的声明 *)
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_declaration state' name in
-      let state''' = free_temp state'' expr_reg in
+      let state''' = free_temp state'' expr_reg in (* 释放表达式寄存器 *)
       (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
-  | DeclStmt (_, name, None) ->
+  | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
       let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
   | AssignStmt (name, expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_use state' name in
-      let state''' = free_temp state'' expr_reg in
+      let state''' = free_temp state'' expr_reg in (* 释放表达式寄存器 *)
       (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
   | IfStmt (cond, then_stmt, else_stmt_opt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
@@ -488,7 +533,7 @@ let rec stmt_to_ir state stmt =
         match else_stmt_opt with
         | Some s -> stmt_to_ir state''''' s
         | None -> ([], state''''') in
-      let state_final = free_temp state'''''' cond_reg in
+      let state_final = free_temp state'''''' cond_reg in (* 释放条件寄存器 *)
       (cond_code @ 
        [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
         Jmp else_label;
@@ -500,13 +545,13 @@ let rec stmt_to_ir state stmt =
        [Label merge_label], state_final)
   | ReturnStmt (Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let state'' = free_temp state' expr_reg in
+      let state'' = free_temp state' expr_reg in (* 释放表达式寄存器 *)
       (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state'')
   | ReturnStmt None ->
       ([Ret], state)
   | ExprStmt expr ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let state'' = free_temp state' expr_reg in
+      let state'' = free_temp state' expr_reg in (* 释放表达式寄存器 *)
       (expr_code, state'')
   | WhileStmt (cond, body) ->
       let (loop_label, state') = fresh_label state "loop" in
@@ -516,7 +561,7 @@ let rec stmt_to_ir state stmt =
       
       let (cond_reg, cond_code, state''') = expr_to_ir state_with_loop cond in
       let (body_code, state'''') = stmt_to_ir state''' body in
-      let state_final = free_temp state'''' cond_reg in
+      let state_final = free_temp state'''' cond_reg in (* 释放条件寄存器 *)
       
       ( [Label loop_label] @
         cond_code @
@@ -546,21 +591,27 @@ and block_to_ir state block =
   let exited_state = leave_scope final_state in
   (code, exited_state)
 
+
+(* 修改 func_to_ir 函数 *)
+(* 修改 func_to_ir 函数 *)
 let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
     stack_size = 0;
     label_counter = 0;
-    current_function = func.name;
+    current_function = func.name; (* 设置当前函数名 *)
   } in
+  (* 为参数设置固定的偏移量，并创建初始作用域 *)
   let param_scope = Hashtbl.create (List.length func.params) in
   let state_with_scope = { state with scope_stack = [param_scope] } in
   
   let state' = 
     List.fold_left (fun st (i, (param : Ast.param)) ->
-      let offset = -(68 + i * 4) in
+      (* 使用与标准代码相同的参数偏移量 *)
+      let offset = -(68 + i * 4) in  (* 参数偏移量: -68, -72, -76, -80, ... *)
       Hashtbl.add param_scope param.name offset;
+      (* 同时添加到 var_offset 中，以便在 IRToRiscV 模块中可以找到 *)
       Hashtbl.add st.var_offset param.name offset;
       st
     ) state_with_scope (List.mapi (fun i x -> (i, x)) func.params)
@@ -573,12 +624,14 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   }, final_state.var_offset
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
+(* 在 IRToRiscV 模块内替换现有的 LivenessAnalysis 模块 *)
 module LivenessAnalysis = struct
   module RegSet = Set.Make(struct
     type t = reg
     let compare = compare
   end)
   
+  (* 计算指令中使用的寄存器 *)
   let regs_used = function
     | Li _ -> RegSet.empty
     | Mv (_, rs) -> RegSet.singleton rs
@@ -589,10 +642,12 @@ module LivenessAnalysis = struct
     | Load (_, _, _) -> RegSet.empty
     | ReloadVar (_, _) -> RegSet.empty
     | Call _ -> 
+        (* 函数调用使用 a0-a7 参数寄存器 *)
         let params = List.init 8 (fun i -> RiscvReg ("a" ^ string_of_int i)) in
         List.fold_left (fun set reg -> RegSet.add reg set) RegSet.empty params
     | _ -> RegSet.empty
   
+  (* 计算指令中定义的寄存器 *)
   let regs_defined = function
     | Li (rd, _) -> RegSet.singleton rd
     | Mv (rd, _) -> RegSet.singleton rd
@@ -600,14 +655,16 @@ module LivenessAnalysis = struct
     | BinaryOpImm (rd, _, _, _) -> RegSet.singleton (RiscvReg rd)
     | Load (rd, _, _) -> RegSet.singleton rd
     | ReloadVar (rd, _) -> RegSet.singleton rd
-    | Call _ -> RegSet.singleton (RiscvReg "a0")
+    | Call _ -> RegSet.singleton (RiscvReg "a0") (* 函数返回值 *)
     | _ -> RegSet.empty
   
+  (* 活跃性信息 *)
   type liveness_info = {
-    live_in: RegSet.t array;
-    live_out: RegSet.t array;
+    live_in: RegSet.t array;   (* 每个指令入口处活跃的寄存器 *)
+    live_out: RegSet.t array;  (* 每个指令出口处活跃的寄存器 *)
   }[@@warning "-69"]
   
+  (* 计算活跃性信息 *)
   let analyze_liveness (instrs: ir_instr list) : liveness_info =
     let n = List.length instrs in
     if n = 0 then
@@ -617,25 +674,34 @@ module LivenessAnalysis = struct
       let live_out = Array.make n RegSet.empty in
       let instr_array = Array.of_list instrs in
       
+      (* 初始化 *)
       for i = 0 to n - 1 do
         live_in.(i) <- RegSet.empty;
         live_out.(i) <- RegSet.empty;
       done;
       
+      (* 迭代计算直到收敛 *)
       let changed = ref true in
       while !changed do
         changed := false;
         
+        (* 反向遍历指令 *)
         for i = n - 1 downto 0 do
           let used = regs_used instr_array.(i) in
           let defined = regs_defined instr_array.(i) in
           
+          (* live_out[i] = union of live_in[j] for all successors j *)
           let new_out = 
-            if i < n - 1 then live_in.(i + 1) else RegSet.empty
+            if i < n - 1 then
+              live_in.(i + 1)  (* 简化处理：假设是线性代码 *)
+            else
+              RegSet.empty
           in
           
+          (* live_in[i] = use[i] union (live_out[i] - def[i]) *)
           let new_in = RegSet.union used (RegSet.diff new_out defined) in
           
+          (* 检查是否有变化 *)
           if not (RegSet.equal live_in.(i) new_in) || 
              not (RegSet.equal live_out.(i) new_out) then
             (
@@ -648,38 +714,20 @@ module LivenessAnalysis = struct
       
       { live_in; live_out }
   
+  (* 获取在特定指令点活跃的寄存器 *)
   let get_live_regs info instr_index =
     if instr_index >= 0 && instr_index < Array.length info.live_in then
       info.live_in.(instr_index)
     else
       RegSet.empty
       
+  (* 检查寄存器在特定点是否活跃 *)
   let is_live info instr_index reg =
     RegSet.mem reg (get_live_regs info instr_index)
 end
 
 module IRToRiscV = struct
-  (* 辅助函数：将32位立即数转换为lui+addi组合（无伪指令） *)
-  let generate_load_imm reg value =
-    let imm = value land 0xFFFFFFFF in  (* 确保是32位无符号数 *)
-    let hi = (imm lsr 12) land 0xFFFFF in  (* 高20位 *)
-    let lo = imm land 0xFFF in             (* 低12位 *)
-    
-    (* 处理符号扩展：如果低12位最高位为1，需要调整高位 *)
-    let lo_signed = if (lo land 0x800) != 0 then lo - 0x1000 else lo in
-    let adjusted_hi = if lo_signed < 0 then hi + 1 else hi in
-    
-    (* 生成指令序列 *)
-    if adjusted_hi = 0 then
-      (* 可以仅用addi实现 *)
-      Printf.sprintf "  addi %s, x0, %d" reg lo_signed
-    else
-      let lui = Printf.sprintf "  lui %s, 0x%x" reg adjusted_hi in
-      if lo_signed = 0 then
-        lui
-      else
-        lui ^ "\n  addi " ^ reg ^ ", " ^ reg ^ ", " ^ string_of_int lo_signed
-
+  (* 寄存器分配映射 *)
   let reg_map var_offsets frame_size = function
     | RiscvReg s -> s
     | Temp n -> 
@@ -688,12 +736,32 @@ module IRToRiscV = struct
         else if n < 15 then 
           Printf.sprintf "a%d" (n - 7)
         else
+          (* 当寄存器不足时，使用栈空间，统一使用s0作为基址 *)
           let stack_offset = -(68 + (n - 15 + 1) * 4) in
           Printf.sprintf "%d(s0)" stack_offset
-  
+
+  (* 加载立即数的辅助函数 - 处理大立即数 *)
+  let load_immediate reg_str imm =
+  if imm >= -2048 && imm <= 2047 then
+    Printf.sprintf "  addi %s, zero, %d" reg_str imm
+  else
+    let upper = imm asr 12 in
+    let lower = imm land 0xFFF in
+    (* 如果低12位是负数，需要调整 *)
+    let (upper, lower) = 
+      if lower >= 2048 then (upper + 1, lower - 4096)
+      else (upper, lower)
+    in
+    if upper <> 0 then
+      Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" reg_str upper reg_str reg_str lower
+    else
+      Printf.sprintf "  addi %s, zero, %d" reg_str lower
+
+  (* 修改instr_to_asm函数以处理栈访问 *)
+  (* 修改 IRToRiscV 模块中的 instr_to_asm 函数 *)
   let instr_to_asm var_offsets frame_size instrs =
     let liveness_info = LivenessAnalysis.analyze_liveness instrs in
-    
+  
     let rec convert_instrs acc_index acc_code instr_list =
       match instr_list with
       | [] -> acc_code
@@ -704,25 +772,23 @@ module IRToRiscV = struct
                 (match r with
                 | Temp temp_reg when temp_reg >= 15 -> 
                     let stack_offset = -(68 + (temp_reg - 15 + 1) * 4) in
-                    let load_t0 = generate_load_imm "t0" n in
-                    load_t0 ^ "\n  sw t0, " ^ string_of_int stack_offset ^ "(s0)"
+                    load_immediate "t0" n ^ 
+                    Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                 | _ -> 
-                    let reg = reg_map var_offsets frame_size r in
-                    generate_load_imm reg n)
+                    let reg_str = reg_map var_offsets frame_size r in
+                    load_immediate reg_str n)
             | Mv (rd, rs) ->
+                let rd_str = reg_map var_offsets frame_size rd in
+                let rs_str = reg_map var_offsets frame_size rs in
                 (match (rd, rs) with
                 | (Temp n, _) when n >= 15 -> 
                     let stack_offset = -(68 + (n - 15 + 1) * 4) in
-                    Printf.sprintf "  mv t0, %s\n  sw t0, %d(s0)" 
-                      (reg_map var_offsets frame_size rs) stack_offset
+                    Printf.sprintf "  addi t0, %s, 0\n  sw t0, %d(s0)" rs_str stack_offset
                 | (_, Temp n) when n >= 15 -> 
                     let stack_offset = -(68 + (n - 15 + 1) * 4) in
-                    Printf.sprintf "  lw t0, %d(s0)\n  mv %s, t0" 
-                      stack_offset (reg_map var_offsets frame_size rd)
+                    Printf.sprintf "  lw t0, %d(s0)\n  addi %s, t0, 0" stack_offset rd_str
                 | _ -> 
-                    Printf.sprintf "  mv %s, %s" 
-                      (reg_map var_offsets frame_size rd) 
-                      (reg_map var_offsets frame_size rs))
+                    Printf.sprintf "  addi %s, %s, 0" rd_str rs_str)
             | BinaryOp (op, rd, rs1, rs2) ->
                 (match (rd, rs1, rs2) with
                 | (Temp n, _, _) when n >= 15 -> 
@@ -744,8 +810,7 @@ module IRToRiscV = struct
                       | _ -> (src2, "")
                     in
                     load1 ^ load2 ^ 
-                    Printf.sprintf "  %s t0, %s, %s\n  sw t0, %d(s0)" 
-                      op reg1 reg2 stack_offset
+                    Printf.sprintf "  %s t0, %s, %s\n  sw t0, %d(s0)" op reg1 reg2 stack_offset
                 | _ ->
                     let dest = reg_map var_offsets frame_size rd in
                     let (reg1, load1) = 
@@ -787,8 +852,7 @@ module IRToRiscV = struct
                       | _ -> (src, "")
                     in
                     load ^ 
-                    Printf.sprintf "  %s t0, %s, %d\n  sw t0, %d(s0)" 
-                      op reg imm stack_offset
+                    Printf.sprintf "  %s t0, %s, %d\n  sw t0, %d(s0)" op reg imm stack_offset
                 | _ ->
                     let dest = reg_map var_offsets frame_size rd in
                     let (reg, load) = 
@@ -811,25 +875,29 @@ module IRToRiscV = struct
                           Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                       | _ -> ""))
             | Branch (cond, rs1, rs2, label) ->
-                let (reg1, load1) = 
+                let cond_inst = match cond with
+                  | "beqz" -> "beq"
+                  | "bnez" -> "bne"
+                  | c -> c
+                in
+                let (rs1_str, load1) = 
                   match rs1 with
-                  | Temp m when m >= 15 -> 
-                      let offset = -(68 + (m - 15 + 1) * 4) in
-                      ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
-                  | _ -> (reg_map var_offsets frame_size rs1, "")
+                  | Temp n when n >= 15 -> 
+                      let offset = -(68 + (n - 15 + 1) * 4) in
+                      (Printf.sprintf "  lw t0, %d(s0)\n" offset, "t0")
+                  | _ -> ("", reg_map var_offsets frame_size rs1)
                 in
-                let (reg2, load2) = 
-                  match rs2 with
-                  | Temp m when m >= 15 -> 
-                      let offset = -(68 + (m - 15 + 1) * 4) in
-                      ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
-                  | _ -> (reg_map var_offsets frame_size rs2, "")
+                let (rs2_str, load2) = 
+                  if cond = "beqz" || cond = "bnez" then 
+                    ("", "zero") 
+                  else 
+                    match rs2 with
+                    | Temp n when n >= 15 -> 
+                        let offset = -(68 + (n - 15 + 1) * 4) in
+                        (Printf.sprintf "  lw t1, %d(s0)\n" offset, "t1")
+                    | _ -> ("", reg_map var_offsets frame_size rs2)
                 in
-                load1 ^ load2 ^
-                (match cond with
-                | "beqz" -> Printf.sprintf "  beq %s, x0, %s" reg1 label
-                | "bnez" -> Printf.sprintf "  bne %s, x0, %s" reg1 label
-                | _ -> Printf.sprintf "  %s %s, %s, %s" cond reg1 reg2 label)
+                rs1_str ^ rs2_str ^ Printf.sprintf "  %s %s, %s, %s" cond_inst load1 load2 label
             | Store (rs, base, offset) ->
                 let (reg, load) = 
                   match rs with
@@ -838,8 +906,7 @@ module IRToRiscV = struct
                       ("t0", Printf.sprintf "  lw t0, %d(s0)\n" stack_offset)
                   | _ -> (reg_map var_offsets frame_size rs, "")
                 in
-                load ^ Printf.sprintf "  sw %s, %d(%s)" 
-                  reg offset (reg_map var_offsets frame_size base)
+                load ^ Printf.sprintf "  sw %s, %d(%s)" reg offset (reg_map var_offsets frame_size base)
             | Load (rd, base, offset) ->
                 (match rd with
                 | Temp n when n >= 15 -> 
@@ -848,8 +915,7 @@ module IRToRiscV = struct
                       offset (reg_map var_offsets frame_size base) stack_offset
                 | _ -> 
                     Printf.sprintf "  lw %s, %d(%s)" 
-                      (reg_map var_offsets frame_size rd) 
-                      offset (reg_map var_offsets frame_size base))
+                      (reg_map var_offsets frame_size rd) offset (reg_map var_offsets frame_size base))
             | ReloadVar (reg, var_name) ->
                 (try
                   let offset = Hashtbl.find var_offsets var_name in
@@ -858,15 +924,16 @@ module IRToRiscV = struct
                       let temp_offset = -(68 + (n - 15 + 1) * 4) in
                       Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" offset temp_offset
                   | _ -> 
-                      Printf.sprintf "  lw %s, %d(s0)" 
-                        (reg_map var_offsets frame_size reg) offset)
+                      Printf.sprintf "  lw %s, %d(s0)" (reg_map var_offsets frame_size reg) offset)
                 with Not_found ->
                   failwith ("Variable " ^ var_name ^ " not found during code generation"))
             | Call func -> 
+                (* 在函数调用前保存活跃的调用者保存寄存器 *)
                 let live_regs = LivenessAnalysis.get_live_regs liveness_info acc_index in
                 let caller_saved = ["t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6"; 
                                    "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7"] in
                 
+                (* 找出需要保存的活跃寄存器 *)
                 let regs_to_save = 
                   LivenessAnalysis.RegSet.fold (fun reg acc ->
                     match reg with
@@ -882,20 +949,23 @@ module IRToRiscV = struct
                           acc
                     | RiscvReg name ->
                         if List.mem name caller_saved then
-                          (name, -1) :: acc
+                          (name, -1) :: acc  (* -1 表示不是临时寄存器 *)
                         else
                           acc
                   ) live_regs []
                 in
                 
+                (* 生成保存代码 *)
                 let save_code = 
                   List.mapi (fun i (reg_name, _) ->
                     Printf.sprintf "  sw %s, -%d(s0)" reg_name (12 + i * 4)
                   ) regs_to_save
                 in
                 
+                (* 函数调用 *)
                 let call_code = "  call " ^ func in
                 
+                (* 生成恢复代码 *)
                 let restore_code = 
                   List.mapi (fun i (reg_name, _) ->
                     Printf.sprintf "  lw %s, -%d(s0)" reg_name (12 + i * 4)
@@ -903,29 +973,37 @@ module IRToRiscV = struct
                 in
                 
                 String.concat "\n" (save_code @ [call_code] @ restore_code)
-            | Jmp label -> "  j " ^ label
-            | Label label -> label ^ ":"
-            | Ret ->
-                let ra_offset = frame_size - 4 in      
-                let s0_offset = frame_size - 8 in      
-                Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
-                Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
-                Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
-                "  jr ra"
+            | instr -> 
+                match instr with
+                | Jmp label -> "  j " ^ label
+                | Label label -> label ^ ":"
+                | Ret ->
+                    let ra_offset = frame_size - 4 in      
+                    let s0_offset = frame_size - 8 in      
+                    Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
+                    Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
+                    Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
+                    "  ret"  (* 使用ret指令 *)
+                | _ -> failwith "Unhandled instruction"
           in
           convert_instrs (acc_index + 1) (acc_code ^ code ^ "\n") rest
     in
     convert_instrs 0 "" instrs
         
+  (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
-    let base_size = 108 in
+    (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
+    let base_size = 108 in (* 至少16字节用于保存 ra 和 s0 *)
     
+    (* 计算额外参数需要的空间 *)
     let extra_param_space = 
       if List.length ir_func.params > 8 then
         (List.length ir_func.params - 8) * 4
-      else 0 
+      else 
+        0 
     in
 
+    (* 分析指令，计算调用其他函数时需要的栈空间 *)
     let call_stack_space = ref 0 in
     let analyze_call_stack instr = 
       match instr with
@@ -935,81 +1013,61 @@ module IRToRiscV = struct
     in
     List.iter analyze_call_stack ir_func.body;
 
-    let used_offsets = ref [] in
-    
-    List.iteri (fun i _ ->
-      if i < 8 then used_offsets := -(68 + i * 4) :: !used_offsets
-    ) ir_func.params;
-    
-    List.iteri (fun i _ ->
-      if i >= 8 then used_offsets := -(68 + i * 4) :: !used_offsets
-    ) ir_func.params;
+    (* 总需求空间 *)
+    let required_space = base_size + extra_param_space + !call_stack_space in
 
-    let max_temp = ref (-1) in
-    let min_offset = ref 0 in
-
-    let analyze_instr = function
-      | Store (_, RiscvReg "s0", offset) when offset < 0 ->
-          used_offsets := offset :: !used_offsets;
-          if offset < !min_offset then min_offset := offset
-      | Load (Temp n, RiscvReg "s0", offset) when offset < 0 ->
-          used_offsets := offset :: !used_offsets;
-          if offset < !min_offset then min_offset := offset;
-          max_temp := max !max_temp n
-      | Li (Temp n, _) | Mv (Temp n, _) | BinaryOp (_, Temp n, _, _)
-      | BinaryOpImm (_, Temp n, _, _) | ReloadVar (Temp n, _) ->
-          max_temp := max !max_temp n
-      | _ -> ()
-    in
-    List.iter analyze_instr ir_func.body;
-
-    let local_var_size = 
-      if !used_offsets <> [] then -(!min_offset) else 0 in
-
-    let temp_stack_size = 
-      if !max_temp >= 15 then (!max_temp - 14) * 4 else 0 in
-
-    let required_space = base_size + local_var_size + temp_stack_size + extra_param_space + !call_stack_space in
+    (* 对齐到16字节边界 *)
     let aligned_size = ((required_space + 15) / 16) * 16 in
-    max aligned_size 32
 
+    (* 确保最小栈帧大小 *)
+    max aligned_size 32
+  
+  (* 函数序言 - 动态计算栈帧大小 *)
   let function_prologue name frame_size =
-    let ra_offset = frame_size - 4 in
-    let s0_offset = frame_size - 8 in
+    let ra_offset = frame_size - 4 in      (* ra保存在栈帧顶部 *)
+    let s0_offset = frame_size - 8 in      (* s0保存在ra下方 *)
     Printf.sprintf "%s:\n" name ^
     Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
     Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
     Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
     Printf.sprintf "  addi s0, sp, %d\n" frame_size
 
+  (* 函数尾声 *)
   let function_epilogue frame_size =
     let ra_offset = frame_size - 4 in 
     let s0_offset = frame_size - 8 in 
     Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
     Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
     Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
-    "  jr ra\n"
+    "  ret\n"  (* 使用ret指令 *)
 
+  (* 转换整个IR函数 *)
   let func_to_asm var_offsets (ir_func : ir_func) =
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
     
     Buffer.add_string buf (function_prologue ir_func.name frame_size);
       
+    (* 保存参数到栈帧 - 使用负偏移量 *)
     List.iteri (fun i param ->
       let offset = -(68 + i * 4) in
       if i < 8 then
+        (* 前8个参数从a0-a7寄存器加载 *)
         Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
       else
          let param_stack_offset = (i - 8) * 4 in
-         Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)\n" param_stack_offset offset)
+      Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0) # 加载额外参数 %s\n  sw t0, %d(s0) # 保存到本地栈帧\n" 
+                           param_stack_offset param offset)
     ) ir_func.params;
     
+    (* 转换指令，传入整个指令列表以支持活跃性分析 *)
     let asm_code = instr_to_asm var_offsets frame_size ir_func.body in
     Buffer.add_string buf asm_code;
     
+    (* 检查是否已经有显式的返回指令 *)
     let has_explicit_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
     
+    (* 如果没有显式返回指令，则添加函数尾声 *)
     if not has_explicit_return then (
       Buffer.add_string buf (function_epilogue frame_size);
     );
@@ -1017,14 +1075,19 @@ module IRToRiscV = struct
     Buffer.contents buf
 end
 
+(* 修改最后的输出部分 *)
 let () =
+  (* 从标准输入读取 *)
   let ast = parse_channel stdin in
   semantic_analysis ast;
   
+  (* 转换为IR *)
   let ir_with_offsets = List.map func_to_ir ast in
   
+  (* 分离IR函数和变量偏移量表 *)
   let (ir_funcs, var_offsets_list) = List.split ir_with_offsets in
   
+  (* 创建一个合并的变量偏移量表 *)
   let combined_var_offsets = Hashtbl.create 50 in
   List.iter (fun var_offsets ->
     Hashtbl.iter (fun name offset ->
@@ -1032,11 +1095,17 @@ let () =
     ) var_offsets
   ) var_offsets_list;
   
+  (* 转换为RISC-V汇编 *)
   let riscv_asm = List.map (IRToRiscV.func_to_asm combined_var_offsets) ir_funcs in
   
-  Printf.printf ".global main\n";
+  (* 添加汇编头部 *)
+  Printf.printf ".globl main\n";
+  Printf.printf ".text\n";
+  
+  (* 输出每个函数 *)
   List.iter (fun f -> 
     Printf.printf "%s\n" f
   ) riscv_asm;
   
+  (* 完成提示到标准错误 *)
   prerr_endline "Compilation successful!";
