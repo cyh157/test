@@ -837,9 +837,7 @@ let instr_to_asm var_offsets frame_size instrs =
           | BinaryOpImm (op, rd, rs, imm) ->
               (* 处理立即数值的辅助函数 *)
               let process_imm_value n =
-                if n = 0 then
-                  "zero"
-                else if n >= -2048 && n <= 2047 then
+                if n >= -2048 && n <= 2047 then
                   string_of_int n
                 else
                   (* 正确分割立即数为 hi 和 lo *)
