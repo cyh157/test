@@ -60,8 +60,8 @@ let fresh_temp state =
     let temp = state.temp_counter in
     (Temp temp, {state with temp_counter = temp + 1})
   else
-    let stack_var = state.stack_size + 1 in
-    (Temp stack_var, {state with stack_size = state.stack_size + 4})
+    let stack_var = state.stack_size in
+    (Temp (26 + stack_var), {state with stack_size = state.stack_size + 1})
 
 let free_temp state temp_reg = 
   match temp_reg with
@@ -91,17 +91,18 @@ let get_var_offset_for_use state var =
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      let offset = -(500  + state.stack_size) in
+      (* 从栈帧基地址向下分配（s0是栈帧基地址） *)
+      let offset = -4 * (1 + state.stack_size) in  (* 修正：使用动态计算而非固定偏移 *)
       Hashtbl.add current_scope var offset;
-      let new_state = {state with stack_size = state.stack_size + 4} in
+      let new_state = {state with stack_size = state.stack_size + 1} in
       (offset, new_state)
   | [] ->
       let new_scope = Hashtbl.create 10 in
-      let offset = -(500  + state.stack_size) in
+      let offset = -4 * (1 + state.stack_size) in  (* 修正：使用动态计算而非固定偏移 *)
       Hashtbl.add new_scope var offset;
       let new_state = {state with 
                        scope_stack = new_scope :: state.scope_stack;
-                       stack_size = state.stack_size + 4} in
+                       stack_size = state.stack_size + 1} in
       (offset, new_state)
 
 (* 将表达式转换为字符串 *)
@@ -553,9 +554,10 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   } in
   let param_scope = Hashtbl.create (List.length func.params) in
   let state_with_scope = { state with scope_stack = [param_scope] } in
+  (* 修正：参数偏移量从-4开始，每次递减4，避免固定偏移导致冲突 *)
   let state' = 
     List.fold_left (fun st (i, (param : Ast.param)) ->
-      let offset = -(68 + i * 4) in
+      let offset = -4 * (i + 1) in  (* 从-4开始，依次为-4, -8, -12... *)
       Hashtbl.add param_scope param.name offset;
       Hashtbl.add st.var_offset param.name offset;
       st
@@ -581,7 +583,8 @@ module IRToRiscV = struct
     | RiscvReg s -> s
     | Temp n when n < Array.length reg_names -> reg_names.(n)
     | Temp n -> 
-        let stack_offset = -(68 + (n - Array.length reg_names) * 4) in
+        let stack_idx = n - Array.length reg_names in
+        let stack_offset = -4 * (stack_idx + 1) in  (* 栈上临时变量偏移 *)
         Printf.sprintf "%d(s0)" stack_offset
 
   (* 拆分32位整数为高位（20位）和低位（12位），适应RISC-V立即数范围 *)
@@ -594,23 +597,25 @@ module IRToRiscV = struct
     (upper, adjusted_lower)
 
   let calculate_frame_size (ir_func : ir_func) =
-    let base_size = 16 in
-    let rec analyze_instrs = function
+    (* 修正：更精确的栈帧大小计算 *)
+    let base_size = 16 in  (* 保存ra, s0和被调用者保存寄存器的基础大小 *)
+    let rec count_stack_temps = function
       | [] -> 0
       | instr :: rest ->
-          let extra = 
-            match instr with
-            | Store (_, RiscvReg "sp", offset) when offset > 0 -> offset + 4
+          let count = match instr with
             | Load (Temp n, _, _) | Li (Temp n, _) | Mv (Temp n, _) 
             | BinaryOp (_, Temp n, _, _) | BinaryOpImm (_, Temp n, _, _) ->
-                if n >= Array.length reg_names then (n - Array.length reg_names + 1) * 4 else 0
+                if n >= Array.length reg_names then 1 else 0
             | _ -> 0
           in
-          max extra (analyze_instrs rest)
+          count + count_stack_temps rest
     in
-    let call_stack = analyze_instrs ir_func.body in
-    let aligned = ((base_size + call_stack + 15) / 16) * 16 in
-    max aligned 32
+    let stack_temps = count_stack_temps ir_func.body in
+    let local_vars = List.length ir_func.params + stack_temps in
+    let frame_size = base_size + 4 * local_vars in
+    (* 栈帧大小按16字节对齐 *)
+    let aligned = ((frame_size + 15) / 16) * 16 in
+    max aligned 32  (* 最小栈帧大小32字节 *)
 
   let instr_to_asm var_offsets frame_size instrs =
     let rec convert_instrs acc_index acc_code instr_list =
@@ -620,7 +625,8 @@ module IRToRiscV = struct
           let handle_reg r =
             match r with
             | Temp n when n >= Array.length reg_names -> 
-                let offset = -(68 + (n - Array.length reg_names) * 4) in
+                let stack_idx = n - Array.length reg_names in
+                let offset = -4 * (stack_idx + 1) in
                 let temp_reg = "t0" in
                 let code = 
                   if offset >= -2048 && offset <= 2047 then
@@ -640,7 +646,8 @@ module IRToRiscV = struct
           let handle_store_reg r value_reg =
             match r with
             | Temp n when n >= Array.length reg_names -> 
-                let offset = -(68 + (n - Array.length reg_names) * 4) in
+                let stack_idx = n - Array.length reg_names in
+                let offset = -4 * (stack_idx + 1) in
                 if offset >= -2048 && offset <= 2047 then
                   [Printf.sprintf "  sw %s, %d(s0)" value_reg offset]
                 else
@@ -779,7 +786,7 @@ module IRToRiscV = struct
   let save_callee_saved frame_size =
     let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
     List.flatten (List.mapi (fun i reg ->
-      let offset = frame_size - 12 - i * 4 in
+      let offset = frame_size - 12 - i * 4 in  (* 从frame_size-12开始，保存s1到s11 *)
       if offset >= -2048 && offset <= 2047 then
         [Printf.sprintf "  sw %s, %d(sp)" reg offset]
       else
@@ -810,8 +817,8 @@ module IRToRiscV = struct
     ) s_regs)
 
   let function_prologue name frame_size =
-    let ra_offset = frame_size - 4 in
-    let s0_offset = frame_size - 8 in
+    let ra_offset = frame_size - 4 in  (* 返回地址保存在栈帧顶部-4处 *)
+    let s0_offset = frame_size - 8 in  (* 保存s0寄存器 *)
     let save_code = save_callee_saved frame_size in
     
     (* 生成调整栈指针的指令（处理大frame_size） *)
@@ -855,6 +862,7 @@ module IRToRiscV = struct
     in
     
     let s0_init =
+      (* s0作为栈帧基地址，指向sp + frame_size *)
       if frame_size >= -2048 && frame_size <= 2047 then
         [Printf.sprintf "  addi s0, sp, %d" frame_size]
       else
@@ -922,7 +930,7 @@ module IRToRiscV = struct
     
     (* 处理参数的指令列表 *)
     let param_code = List.flatten (List.mapi (fun i param ->
-      let offset = -(68 + i * 4) in
+      let offset = -4 * (i + 1) in  (* 参数偏移：-4, -8, -12... *)
       if i < 8 then (
         if offset >= -2048 && offset <= 2047 then
           [Printf.sprintf "  sw a%d, %d(s0)" i offset]
