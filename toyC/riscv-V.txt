@@ -1,0 +1,1326 @@
+.global main
+factorial:
+  addi sp, sp, -48
+  sw ra, 44(sp)
+  sw s0, 40(sp)
+  addi s0, sp, 48
+  sw a0, -16(s0)
+  lw t0, -16(s0)
+  li t1, 1
+  slt t1, t1, t0
+  xori t2, t1, 1
+  bne t2, zero, factorial_then0
+  j factorial_else1
+factorial_then0:
+  li t1, 1
+  mv a0, t1
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j factorial_merge2
+factorial_else1:
+factorial_merge2:
+  lw t2, -16(s0)
+  lw t1, -16(s0)
+  addi t3, t1, -1
+  mv a0, t3
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call factorial
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t3, a0
+  lw t2, -16(s0)
+  mul t0, t2, t3
+  mv a0, t0
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+
+fibonacci:
+  addi sp, sp, -48
+  sw ra, 44(sp)
+  sw s0, 40(sp)
+  addi s0, sp, 48
+  sw a0, -16(s0)
+  lw t0, -16(s0)
+  mv t1, zero
+  slt t1, t1, t0
+  xori t2, t1, 1
+  bne t2, zero, fibonacci_then0
+  j fibonacci_else1
+fibonacci_then0:
+  mv t1, zero
+  mv a0, t1
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j fibonacci_merge2
+fibonacci_else1:
+fibonacci_merge2:
+  lw t2, -16(s0)
+  li t1, 1
+  xor t1, t2, t1
+  sltu t2, zero, t1
+  xori t0, t2, 1
+  bne t0, zero, fibonacci_then3
+  j fibonacci_else4
+fibonacci_then3:
+  li t2, 1
+  mv a0, t2
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j fibonacci_merge5
+fibonacci_else4:
+fibonacci_merge5:
+  lw t0, -16(s0)
+  addi t1, t0, -1
+  mv a0, t1
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call fibonacci
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t1, a0
+  lw t2, -16(s0)
+  addi t3, t2, -2
+  mv a0, t3
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call fibonacci
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t3, a0
+  add t0, t1, t3
+  mv a0, t0
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+
+gcd:
+  addi sp, sp, -64
+  sw ra, 60(sp)
+  sw s0, 56(sp)
+  addi s0, sp, 64
+  sw a0, -16(s0)
+  sw a1, -20(s0)
+  lw t0, -20(s0)
+  mv t1, zero
+  xor t1, t0, t1
+  sltu t0, zero, t1
+  xori t2, t0, 1
+  bne t2, zero, gcd_then0
+  j gcd_else1
+gcd_then0:
+  lw t0, -16(s0)
+  mv a0, t0
+  lw ra, 60(sp)
+  lw s0, 56(sp)
+  addi sp, sp, 64
+  jr ra
+  j gcd_merge2
+gcd_else1:
+gcd_merge2:
+  lw t2, -20(s0)
+  mv a0, t2
+  lw t2, -16(s0)
+  lw t0, -20(s0)
+  rem t1, t2, t0
+  mv a1, t1
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call gcd
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t1, a0
+  mv a0, t1
+  lw ra, 60(sp)
+  lw s0, 56(sp)
+  addi sp, sp, 64
+  jr ra
+
+is_prime:
+  addi sp, sp, -48
+  sw ra, 44(sp)
+  sw s0, 40(sp)
+  addi s0, sp, 48
+  sw a0, -16(s0)
+  lw t0, -16(s0)
+  li t1, 1
+  slt t1, t1, t0
+  xori t2, t1, 1
+  bne t2, zero, is_prime_then0
+  j is_prime_else1
+is_prime_then0:
+  mv t1, zero
+  mv a0, t1
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j is_prime_merge2
+is_prime_else1:
+is_prime_merge2:
+  lw t2, -16(s0)
+  li t1, 3
+  slt t1, t1, t2
+  xori t0, t1, 1
+  bne t0, zero, is_prime_then3
+  j is_prime_else4
+is_prime_then3:
+  li t1, 1
+  mv a0, t1
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j is_prime_merge5
+is_prime_else4:
+is_prime_merge5:
+  lw t0, -16(s0)
+  li t1, 2
+  rem t2, t0, t1
+  mv t1, zero
+  xor t1, t2, t1
+  sltu t2, zero, t1
+  xori t0, t2, 1
+  bne t0, zero, is_prime_or_true6
+  lw t2, -16(s0)
+  li t1, 3
+  rem t3, t2, t1
+  mv t1, zero
+  xor t1, t3, t1
+  sltu t3, zero, t1
+  xori t2, t3, 1
+  mv t3, t2
+  j is_prime_or_merge7
+is_prime_or_true6:
+  li t3, 1
+is_prime_or_merge7:
+  bne t3, zero, is_prime_then8
+  j is_prime_else9
+is_prime_then8:
+  mv t3, zero
+  mv a0, t3
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j is_prime_merge10
+is_prime_else9:
+is_prime_merge10:
+  li t3, 5
+  sw t3, -16(s0)
+is_prime_loop11:
+  lw t3, -16(s0)
+  lw t1, -16(s0)
+  mul t4, t3, t1
+  lw t1, -16(s0)
+  slt t1, t1, t4
+  xori t3, t1, 1
+  beq t3, zero, is_prime_end12
+  lw t1, -16(s0)
+  lw t4, -16(s0)
+  rem t5, t1, t4
+  mv t4, zero
+  xor t4, t5, t4
+  sltu t5, zero, t4
+  xori t1, t5, 1
+  bne t1, zero, is_prime_or_true13
+  lw t5, -16(s0)
+  lw t4, -16(s0)
+  li t6, 2
+  add a0, t4, t6
+  rem t6, t5, a0
+  mv a0, zero
+  xor a0, t6, a0
+  sltu t6, zero, a0
+  xori t5, t6, 1
+  mv t6, t5
+  j is_prime_or_merge14
+is_prime_or_true13:
+  li t6, 1
+is_prime_or_merge14:
+  bne t6, zero, is_prime_then15
+  j is_prime_else16
+is_prime_then15:
+  mv t6, zero
+  mv a0, t6
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+  j is_prime_merge17
+is_prime_else16:
+is_prime_merge17:
+  lw t6, -16(s0)
+  li a0, 6
+  add t4, t6, a0
+  sw t4, -16(s0)
+  j is_prime_loop11
+is_prime_end12:
+  li t3, 1
+  mv a0, t3
+  lw ra, 44(sp)
+  lw s0, 40(sp)
+  addi sp, sp, 48
+  jr ra
+
+main:
+  addi sp, sp, -304
+  sw ra, 300(sp)
+  sw s0, 296(sp)
+  addi s0, sp, 304
+  li t0, 401
+  sub t1, zero, t0
+  sw t1, -16(s0)
+  li t1, 17
+  sw t1, -20(s0)
+  li t1, 344
+  sw t1, -24(s0)
+  li t1, 153
+  sub t0, zero, t1
+  sw t0, -28(s0)
+  lw t0, -16(s0)
+  lw t1, -20(s0)
+  add t2, t0, t1
+  lw t1, -24(s0)
+  mul t0, t2, t1
+  lw t1, -28(s0)
+  lw t2, -16(s0)
+  mul t3, t1, t2
+  add t2, t0, t3
+  lw t3, -20(s0)
+  lw t0, -24(s0)
+  add t1, t3, t0
+  lw t0, -16(s0)
+  lw t3, -28(s0)
+  sub t4, zero, t3
+  add t3, t0, t4
+  lui t1, 1
+  addi t1, t1, -2048
+  mv t4, t1
+  add t0, t3, t4
+  rem t4, t1, t0
+  li t0, 1
+  add t1, t4, t0
+  div t0, t2, t1
+  lw t1, -16(s0)
+  sub t2, zero, t1
+  lw t1, -20(s0)
+  sub t4, zero, t1
+  mul t1, t2, t4
+  lw t4, -24(s0)
+  mul t2, t1, t4
+  lw t4, -28(s0)
+  li t1, 2
+  sub t3, t4, t1
+  lw t1, -24(s0)
+  sub t4, zero, t1
+  sub t1, t3, t4
+  mul t4, t2, t1
+  add t1, t0, t4
+  sw t1, -32(s0)
+  li t1, 133
+  sub t4, zero, t1
+  sw t4, -36(s0)
+  li t4, 425
+  sw t4, -40(s0)
+  li t4, 174
+  sw t4, -44(s0)
+  mv t4, zero
+  sw t4, -48(s0)
+  lw t4, -36(s0)
+  lw t1, -40(s0)
+  slt t0, t1, t4
+  beq t0, zero, main_and_false0
+  lw t1, -44(s0)
+  li t4, 1
+  add t2, t1, t4
+  li t4, 1
+  xor t4, t2, t4
+  sltu t2, zero, t4
+  xori t1, t2, 1
+  mv t2, t1
+  j main_and_merge1
+main_and_false0:
+  mv t2, zero
+main_and_merge1:
+  bne t2, zero, main_then2
+  j main_else3
+main_then2:
+  li t2, 1
+  sw t2, -48(s0)
+  j main_merge4
+main_else3:
+main_merge4:
+  mv t2, zero
+  sw t2, -52(s0)
+  lw t2, -36(s0)
+  lw t4, -40(s0)
+  slt t3, t2, t4
+  bne t3, zero, main_or_true5
+  lw t4, -44(s0)
+  li t2, 2
+  add t5, t4, t2
+  li t2, 2
+  xor t2, t5, t2
+  sltu t5, zero, t2
+  xori t4, t5, 1
+  mv t5, t4
+  j main_or_merge6
+main_or_true5:
+  li t5, 1
+main_or_merge6:
+  bne t5, zero, main_then7
+  j main_else8
+main_then7:
+  li t5, 1
+  sw t5, -52(s0)
+  j main_merge9
+main_else8:
+main_merge9:
+  mv t5, zero
+  sw t5, -56(s0)
+  lw t5, -36(s0)
+  li t2, 305
+  sub t6, zero, t2
+  slt t2, t6, t5
+  beq t2, zero, main_and_false10
+  lw t6, -40(s0)
+  li t5, 881
+  slt a0, t6, t5
+  mv t5, a0
+  j main_and_merge11
+main_and_false10:
+  mv t5, zero
+main_and_merge11:
+  bne t5, zero, main_or_true14
+  lw t6, -44(s0)
+  li a1, 751
+  slt a2, a1, t6
+  beq a2, zero, main_and_false12
+  lw a1, -36(s0)
+  li t6, 991
+  slt a3, a1, t6
+  mv t6, a3
+  j main_and_merge13
+main_and_false12:
+  mv t6, zero
+main_and_merge13:
+  mv t6, t6
+  j main_or_merge15
+main_or_true14:
+  li t6, 1
+main_or_merge15:
+  sltu t6, zero, t6
+  xori t6, t6, 1
+  beq t6, zero, main_and_false18
+  lw a1, -40(s0)
+  li a4, 887
+  slt a5, a4, a1
+  bne a5, zero, main_or_true16
+  lw a4, -36(s0)
+  li a1, 273
+  slt a6, a4, a1
+  mv a1, a6
+  j main_or_merge17
+main_or_true16:
+  li a1, 1
+main_or_merge17:
+  mv a1, a1
+  j main_and_merge19
+main_and_false18:
+  mv a1, zero
+main_and_merge19:
+  bne a1, zero, main_then20
+  j main_else21
+main_then20:
+  li a1, 1
+  sw a1, -56(s0)
+  j main_merge22
+main_else21:
+main_merge22:
+  lui t1, 1
+  addi t1, t1, 1458
+  mv a1, t1
+  sw a1, -60(s0)
+  lui t1, 4
+  addi t1, t1, 908
+  mv a1, t1
+  sw a1, -64(s0)
+  lui t1, 2
+  addi t1, t1, 914
+  mv a1, t1
+  sw a1, -68(s0)
+  lw a1, -64(s0)
+  li a4, 12
+  rem a7, a1, a4
+  mv a0, a7
+  lw a7, -68(s0)
+  li a4, 12
+  rem a1, a7, a4
+  mv a1, a1
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call gcd
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv a1, a0
+  mv a0, a1
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call factorial
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv a1, a0
+  lw a4, -60(s0)
+  li a7, 10
+  rem t0, a4, a7
+  sw t0, -20(s0)
+  li a7, 2
+  lw t1, -20(s0)
+  add a4, t1, a7
+  mv a0, a4
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call fibonacci
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv a4, a0
+  add a7, a1, a4
+  sw a7, -72(s0)
+  mv a7, zero
+  sw a7, -76(s0)
+  lw a7, -60(s0)
+  lw a4, -64(s0)
+  slt a1, a4, a7
+  beq a1, zero, main_and_false23
+  lw a4, -60(s0)
+  lw a7, -68(s0)
+  slt t0, a7, a4
+  sw t0, -20(s0)
+  lw t0, -20(s0)
+  mv a7, t0
+  j main_and_merge24
+main_and_false23:
+  mv a7, zero
+main_and_merge24:
+  bne a7, zero, main_then25
+  j main_else26
+main_then25:
+  lw a7, -60(s0)
+  sw a7, -76(s0)
+  j main_merge27
+main_else26:
+  lw a7, -64(s0)
+  lw a4, -60(s0)
+  slt t0, a4, a7
+  sw t0, -24(s0)
+  lw t1, -24(s0)
+  beq t1, zero, main_and_false28
+  lw a4, -64(s0)
+  lw a7, -68(s0)
+  slt t0, a7, a4
+  sw t0, -28(s0)
+  lw t0, -28(s0)
+  mv a7, t0
+  j main_and_merge29
+main_and_false28:
+  mv a7, zero
+main_and_merge29:
+  bne a7, zero, main_then30
+  j main_else31
+main_then30:
+  lw a7, -64(s0)
+  sw a7, -76(s0)
+  j main_merge32
+main_else31:
+  lw a7, -68(s0)
+  sw a7, -76(s0)
+main_merge32:
+main_merge27:
+  mv a7, zero
+  sw a7, -80(s0)
+  li a7, 1
+  sw a7, -84(s0)
+main_loop33:
+  lw a7, -84(s0)
+  li a4, 15
+  slt a4, a4, a7
+  xori t0, t2, 1
+  sw t0, -32(s0)
+  lw t1, -32(s0)
+  beq t1, zero, main_end34
+  lw a4, -84(s0)
+  li a7, 2
+  rem t0, a4, a7
+  sw t0, -36(s0)
+  mv a7, zero
+  lw t1, -36(s0)
+  xor a7, t1, a7
+  sltu t0, zero, a7
+  sw t0, -36(s0)
+  lw t2, -36(s0)
+  xori a4, t2, 1
+  bne a4, zero, main_then35
+  j main_else36
+main_then35:
+  lw t0, -80(s0)
+  sw t0, -36(s0)
+  lw a7, -84(s0)
+  lw t0, -84(s0)
+  sw t0, -40(s0)
+  lw t2, -40(s0)
+  mul t0, a7, t2
+  sw t0, -44(s0)
+  lw t1, -36(s0)
+  lw t2, -44(s0)
+  add t0, t1, t2
+  sw t0, -40(s0)
+  lw t0, -40(s0)
+  sw t0, -80(s0)
+  j main_merge37
+main_else36:
+  lw t0, -84(s0)
+  sw t0, -40(s0)
+  li t0, 5
+  sw t0, -44(s0)
+  lw t1, -40(s0)
+  lw t2, -44(s0)
+  rem t0, t1, t2
+  sw t0, -36(s0)
+  sw zero, -44(s0)
+  lw t1, -36(s0)
+  lw t2, -44(s0)
+  xor t0, t1, t2
+  sw t0, -44(s0)
+  lw t2, -44(s0)
+  sltu t0, zero, t2
+  sw t0, -36(s0)
+  lw t2, -36(s0)
+  xori t0, t2, 1
+  sw t0, -40(s0)
+  lw t1, -40(s0)
+  bne t1, zero, main_then38
+  j main_else39
+main_then38:
+  lw t0, -80(s0)
+  sw t0, -36(s0)
+  lw t0, -84(s0)
+  sw t0, -44(s0)
+  lw a7, -84(s0)
+  lw t1, -44(s0)
+  mul t0, t1, a7
+  sw t0, -48(s0)
+  lw a7, -84(s0)
+  lw t1, -48(s0)
+  mul t0, t1, a7
+  sw t0, -44(s0)
+  lw t1, -36(s0)
+  lw t2, -44(s0)
+  add a7, t1, t2
+  sw a7, -80(s0)
+  j main_merge40
+main_else39:
+  lw a7, -80(s0)
+  lw t0, -84(s0)
+  sw t0, -44(s0)
+  lw t2, -44(s0)
+  add t0, a7, t2
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -80(s0)
+main_merge40:
+main_merge37:
+  lw a4, -84(s0)
+  li t0, 1
+  sw t0, -40(s0)
+  lw t2, -40(s0)
+  add t0, a4, t2
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -84(s0)
+  j main_loop33
+main_end34:
+  sw zero, -32(s0)
+  lw t0, -32(s0)
+  sw t0, -88(s0)
+  li t0, 1
+  sw t0, -32(s0)
+  lw t0, -32(s0)
+  sw t0, -84(s0)
+main_loop41:
+  lw t0, -84(s0)
+  sw t0, -32(s0)
+  li t0, 6
+  sw t0, -36(s0)
+  lw t1, -36(s0)
+  lw t2, -32(s0)
+  slt t0, t1, t2
+  sw t0, -36(s0)
+  lw t2, -36(s0)
+  xori t0, t2, 1
+  sw t0, -40(s0)
+  lw t1, -40(s0)
+  beq t1, zero, main_end42
+  li t0, 1
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -92(s0)
+  li t0, 1
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -96(s0)
+main_loop43:
+  lw t0, -92(s0)
+  sw t0, -36(s0)
+  lw t0, -84(s0)
+  sw t0, -32(s0)
+  lw t1, -32(s0)
+  lw t2, -36(s0)
+  slt t0, t1, t2
+  sw t0, -32(s0)
+  lw t2, -32(s0)
+  xori a4, t2, 1
+  beq a4, zero, main_end44
+  lw t0, -96(s0)
+  sw t0, -32(s0)
+  lw t0, -92(s0)
+  sw t0, -36(s0)
+  lw t1, -32(s0)
+  lw t2, -36(s0)
+  mul t0, t1, t2
+  sw t0, -44(s0)
+  lw t0, -44(s0)
+  sw t0, -96(s0)
+  lw t0, -92(s0)
+  sw t0, -44(s0)
+  li t0, 1
+  sw t0, -36(s0)
+  lw t1, -44(s0)
+  lw t2, -36(s0)
+  add t0, t1, t2
+  sw t0, -32(s0)
+  lw t0, -32(s0)
+  sw t0, -92(s0)
+  j main_loop43
+main_end44:
+  lw a4, -88(s0)
+  lw t0, -96(s0)
+  sw t0, -32(s0)
+  lw t2, -32(s0)
+  add t0, a4, t2
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -88(s0)
+  lw t0, -84(s0)
+  sw t0, -36(s0)
+  li t0, 1
+  sw t0, -32(s0)
+  lw t1, -36(s0)
+  lw t2, -32(s0)
+  add a4, t1, t2
+  sw a4, -84(s0)
+  j main_loop41
+main_end42:
+  sw zero, -40(s0)
+  lw t0, -40(s0)
+  sw t0, -100(s0)
+  lw t0, -60(s0)
+  sw t0, -40(s0)
+  lw t0, -40(s0)
+  mv a0, t0
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call is_prime
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t0, a0
+  sw t0, -40(s0)
+  lw t1, -40(s0)
+  bne t1, zero, main_then45
+  j main_else46
+main_then45:
+  lw a4, -64(s0)
+  mv a0, a4
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call is_prime
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv a4, a0
+  bne a4, zero, main_then48
+  j main_else49
+main_then48:
+  lw t0, -60(s0)
+  sw t0, -32(s0)
+  lw t0, -64(s0)
+  sw t0, -36(s0)
+  lw t1, -32(s0)
+  lw t2, -36(s0)
+  mul t0, t1, t2
+  sw t0, -44(s0)
+  lw t0, -44(s0)
+  sw t0, -100(s0)
+  j main_merge50
+main_else49:
+  lw t0, -68(s0)
+  sw t0, -44(s0)
+  lw t0, -44(s0)
+  mv a0, t0
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call is_prime
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t0, a0
+  sw t0, -44(s0)
+  lw t1, -44(s0)
+  bne t1, zero, main_then51
+  j main_else52
+main_then51:
+  lw t0, -60(s0)
+  sw t0, -36(s0)
+  lw t0, -68(s0)
+  sw t0, -32(s0)
+  lw t1, -36(s0)
+  lw t2, -32(s0)
+  mul a7, t1, t2
+  sw a7, -100(s0)
+  j main_merge53
+main_else52:
+  lw a7, -60(s0)
+  sw a7, -100(s0)
+main_merge53:
+main_merge50:
+  j main_merge47
+main_else46:
+  lw a4, -64(s0)
+  mv a0, a4
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call is_prime
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv a4, a0
+  bne a4, zero, main_then54
+  j main_else55
+main_then54:
+  lw t0, -68(s0)
+  sw t0, -44(s0)
+  lw t0, -44(s0)
+  mv a0, t0
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call is_prime
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t0, a0
+  sw t0, -44(s0)
+  lw t1, -44(s0)
+  bne t1, zero, main_then57
+  j main_else58
+main_then57:
+  lw a7, -64(s0)
+  lw t0, -68(s0)
+  sw t0, -32(s0)
+  lw t2, -32(s0)
+  mul t0, a7, t2
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -100(s0)
+  j main_merge59
+main_else58:
+  lw t0, -64(s0)
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -100(s0)
+main_merge59:
+  j main_merge56
+main_else55:
+  lw t0, -68(s0)
+  sw t0, -44(s0)
+  lw t0, -44(s0)
+  mv a0, t0
+  sw t0, -20(s0)
+  sw t1, -24(s0)
+  sw t2, -28(s0)
+  sw t3, -32(s0)
+  sw t4, -36(s0)
+  sw t5, -40(s0)
+  sw t6, -44(s0)
+  sw a1, -48(s0)
+  sw a2, -52(s0)
+  sw a3, -56(s0)
+  sw a4, -60(s0)
+  sw a5, -64(s0)
+  sw a6, -68(s0)
+  sw a7, -72(s0)
+  call is_prime
+  lw a7, -72(s0)
+  lw a6, -68(s0)
+  lw a5, -64(s0)
+  lw a4, -60(s0)
+  lw a3, -56(s0)
+  lw a2, -52(s0)
+  lw a1, -48(s0)
+  lw t6, -44(s0)
+  lw t5, -40(s0)
+  lw t4, -36(s0)
+  lw t3, -32(s0)
+  lw t2, -28(s0)
+  lw t1, -24(s0)
+  lw t0, -20(s0)
+  mv t0, a0
+  sw t0, -44(s0)
+  lw t1, -44(s0)
+  bne t1, zero, main_then60
+  j main_else61
+main_then60:
+  lw t0, -68(s0)
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -100(s0)
+  j main_merge62
+main_else61:
+  lw t0, -60(s0)
+  sw t0, -36(s0)
+  lw t0, -64(s0)
+  sw t0, -32(s0)
+  lw t1, -36(s0)
+  lw t2, -32(s0)
+  add a7, t1, t2
+  lw t0, -68(s0)
+  sw t0, -32(s0)
+  lw t2, -32(s0)
+  add t0, a7, t2
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -100(s0)
+main_merge62:
+main_merge56:
+main_merge47:
+  sw zero, -40(s0)
+  lw t0, -40(s0)
+  sw t0, -104(s0)
+  lui t1, 1095
+  addi t1, t1, 504
+  sw t1, -40(s0)
+  lw t0, -40(s0)
+  sw t0, -108(s0)
+  sw zero, -40(s0)
+  lw t0, -40(s0)
+  sw t0, -112(s0)
+main_loop63:
+  lw t0, -108(s0)
+  sw t0, -40(s0)
+  mv a4, zero
+  lw t2, -40(s0)
+  slt t0, a4, t2
+  sw t0, -44(s0)
+  lw t1, -44(s0)
+  beq t1, zero, main_end64
+  lw a4, -108(s0)
+  li t0, 2
+  sw t0, -40(s0)
+  lw t2, -40(s0)
+  rem t0, a4, t2
+  sw t0, -36(s0)
+  li t0, 1
+  sw t0, -40(s0)
+  lw t1, -36(s0)
+  lw t2, -40(s0)
+  xor t0, t1, t2
+  sw t0, -40(s0)
+  lw t2, -40(s0)
+  sltu t0, zero, t2
+  sw t0, -36(s0)
+  lw t2, -36(s0)
+  xori a4, t2, 1
+  bne a4, zero, main_then65
+  j main_else66
+main_then65:
+  lw t0, -112(s0)
+  sw t0, -36(s0)
+  li t0, 1
+  sw t0, -40(s0)
+  lw t1, -36(s0)
+  lw t2, -40(s0)
+  add t0, t1, t2
+  sw t0, -32(s0)
+  lw t0, -32(s0)
+  sw t0, -112(s0)
+  j main_merge67
+main_else66:
+main_merge67:
+  lw a4, -108(s0)
+  li t0, 2
+  sw t0, -36(s0)
+  lw t2, -36(s0)
+  div t0, a4, t2
+  sw t0, -40(s0)
+  lw t0, -40(s0)
+  sw t0, -108(s0)
+  j main_loop63
+main_end64:
+  lw t0, -32(s0)
+  sw t0, -44(s0)
+  lw t0, -48(s0)
+  sw t0, -40(s0)
+  lw t1, -44(s0)
+  lw t2, -40(s0)
+  add t0, t1, t2
+  sw t0, -36(s0)
+  lw t0, -52(s0)
+  sw t0, -40(s0)
+  lw t1, -36(s0)
+  lw t2, -40(s0)
+  sub t0, t1, t2
+  sw t0, -44(s0)
+  lw t0, -56(s0)
+  sw t0, -40(s0)
+  lw t1, -44(s0)
+  lw t2, -40(s0)
+  sub t0, t1, t2
+  sw t0, -36(s0)
+  lw t0, -72(s0)
+  sw t0, -40(s0)
+  lw t1, -36(s0)
+  lw t2, -40(s0)
+  add t0, t1, t2
+  sw t0, -44(s0)
+  lw t0, -76(s0)
+  sw t0, -40(s0)
+  lw t1, -44(s0)
+  lw t2, -40(s0)
+  add t0, t1, t2
+  sw t0, -36(s0)
+  lw t0, -80(s0)
+  sw t0, -40(s0)
+  lw t1, -36(s0)
+  lw t2, -40(s0)
+  sub t0, t1, t2
+  sw t0, -44(s0)
+  lw t0, -88(s0)
+  sw t0, -40(s0)
+  lw t1, -44(s0)
+  lw t2, -40(s0)
+  sub t0, t1, t2
+  sw t0, -36(s0)
+  lw t0, -100(s0)
+  sw t0, -40(s0)
+  lw t1, -36(s0)
+  lw t2, -40(s0)
+  add t0, t1, t2
+  sw t0, -44(s0)
+  lw t0, -112(s0)
+  sw t0, -40(s0)
+  lw t1, -44(s0)
+  lw t2, -40(s0)
+  sub t0, t1, t2
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  sw t0, -116(s0)
+  lw t0, -116(s0)
+  sw t0, -36(s0)
+  lw t0, -36(s0)
+  mv a0, t0
+  lw ra, 300(sp)
+  lw s0, 296(sp)
+  addi sp, sp, 304
+  jr ra
