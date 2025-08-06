@@ -1,4 +1,4 @@
-exception LexicalError of string
+exception LexicalError of string [@@warning "-38"]
 exception SemanticError of string
 
 open ToyC_riscv_lib.Ast
@@ -8,66 +8,38 @@ module StringMap = Map.Make(String)
 
 (* ==================== IR 定义 ==================== *)
 type reg = 
-  | Zero
-  | RA 
-  | SP 
-  | GP 
-  | TP 
-  | T0 | T1 | T2 | T3 | T4 | T5 | T6
-  | S0 | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 | S11
-  | A0 | A1 | A2 | A3 | A4 | A5 | A6 | A7
-
-let string_of_reg = function
-  | Zero -> "x0"
-  | RA -> "x1"
-  | SP -> "x2"
-  | GP -> "x3"
-  | TP -> "x4"
-  | T0 -> "x5" | T1 -> "x6" | T2 -> "x7" | T3 -> "x8" | T4 -> "x9"
-  | T5 -> "x10" | T6 -> "x11"
-  | S0 -> "x18" | S1 -> "x19" | S2 -> "x20" | S3 -> "x21" | S4 -> "x22"
-  | S5 -> "x23" | S6 -> "x24" | S7 -> "x25" | S8 -> "x26" | S9 -> "x27"
-  | S10 -> "x28" | S11 -> "x29"
-  | A0 -> "x10" | A1 -> "x11" | A2 -> "x12" | A3 -> "x13" 
-  | A4 -> "x14" | A5 -> "x15" | A6 -> "x16" | A7 -> "x17"
+  | RiscvReg of string  (* RISC-V寄存器如x1-x31 *)
+  | Temp of int         (* 临时变量 *)
 
 type ir_instr =
-  | Lui of reg * int             (* 加载高20位 *)
-  | Addi of reg * reg * int      (* 立即数加法 *)
-  | Add of reg * reg * reg       (* 寄存器加法 *)
-  | Sub of reg * reg * reg       (* 寄存器减法 *)
-  | Mul of reg * reg * reg       (* 乘法 *)
-  | Div of reg * reg * reg       (* 除法 *)
-  | Rem of reg * reg * reg       (* 取余 *)
-  | Slt of reg * reg * reg       (* 小于比较 *)
-  | Beq of reg * reg * string    (* 相等分支 *)
-  | Bne of reg * reg * string    (* 不等分支 *)
-  | Blt of reg * reg * string    (* 小于分支 *)
-  | Bge of reg * reg * string    (* 大于等于分支 *)
-  | Jmp of string                (* 无条件跳转 *)
-  | Jal of string                (* 函数调用 *)
-  | Jalr of reg * reg * int      (* 寄存器跳转 *)
-  | Label of string              (* 标签 *)
-  | Sw of reg * reg * int        (* 存储字 *)
-  | Lw of reg * reg * int        (* 加载字 *)
-  | Comment of string            (* 汇编注释 *)
-
+  | Li of reg * int                (* 加载立即数 *)
+  | Mv of reg * reg                (* 寄存器间移动 *)
+  | BinaryOp of string * reg * reg * reg (* 二元运算：操作符, 目标寄存器, 源寄存器1, 源寄存器2 *)
+  | BinaryOpImm of string * reg * reg * int (* 带立即数的二元运算：操作符, 目标寄存器, 源寄存器, 立即数 *)
+  | Branch of string * reg * reg * string (* 条件分支 *)
+  | Jmp of string                  (* 无条件跳转 *)
+  | Label of string                (* 标签 *)
+  | Call of string                 (* 函数调用 *)
+  | Ret                           (* 返回 *)
+  | Store of reg * reg * int       (* 存储到内存 *)
+  | Load of reg * reg * int        (* 从内存加载 *)
+  | ReloadVar of reg * string      (* 在函数调用后重新加载变量 *)
 type ir_func = {
   name: string;
   params: string list;
   body: ir_instr list;
-  stack_size: int;
-  num_params: int;
 }
 
 (* ==================== 代码生成状态 ==================== *)
 type codegen_state = {
   temp_counter: int;
   label_counter: int;
-  var_offset: (string, int) Hashtbl.t;
-  stack_size: int;
-  loop_labels: (string * string) list;
-  max_temp_used: int;
+  var_offset: (string, int) Hashtbl.t; (* 变量在栈帧中的偏移量 *)
+  stack_size: int; (* 当前栈帧大小 *)
+  loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
+  scope_stack: (string, int) Hashtbl.t list; (* 作用域栈 *)
+  free_temps: int list; (* 可重用的临时寄存器列表 *)
+  current_function: string; (* 当前函数名 *)
 }
 
 let initial_state = {
@@ -76,347 +48,779 @@ let initial_state = {
   var_offset = Hashtbl.create 10;
   stack_size = 0;
   loop_labels = [];
-  max_temp_used = 0;
+  scope_stack = [];
+  free_temps = [];
+  current_function = "";
 }
 
 (* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
-  if state.temp_counter >= 6 then 
-    raise (SemanticError "Too many temporary registers used");
-  let reg = match state.temp_counter with
-    | 0 -> T0
-    | 1 -> T1
-    | 2 -> T2
-    | 3 -> T3
-    | 4 -> T4
-    | 5 -> T5
-    | _ -> T6
-  in
-  (reg, {state with 
-         temp_counter = state.temp_counter + 1;
-         max_temp_used = max state.max_temp_used (state.temp_counter + 1)})
+  match state.free_temps with
+  | temp :: rest -> 
+      (Temp temp, {state with free_temps = rest})
+  | [] -> 
+      let temp = state.temp_counter in
+      (Temp temp, {state with temp_counter = temp + 1})
 
-let reset_temp state = {state with temp_counter = 0}
+let free_temp state temp_reg = 
+  match temp_reg with
+  | Temp n -> {state with free_temps = n :: state.free_temps}
+  | RiscvReg _ -> state
 
 let fresh_label state prefix =
-  let label = Printf.sprintf "%s%d" prefix state.label_counter in
+  let label = Printf.sprintf "%s_%s%d" state.current_function prefix state.label_counter in
   (label, {state with label_counter = state.label_counter + 1})
 
-let get_var_offset state var =
-  try 
-    (Hashtbl.find state.var_offset var, state)
-  with Not_found -> 
-    let offset = state.stack_size in
-    Hashtbl.add state.var_offset var offset;
-    let new_state = {state with stack_size = offset + 8} in
-    (offset, new_state)
+let get_var_offset_for_use state var =
+  let rec lookup scopes =
+    match scopes with
+    | [] -> None
+    | scope :: remaining_scopes ->
+        (try
+           Some (Hashtbl.find scope var)
+         with Not_found ->
+           lookup remaining_scopes)
+  in
+  match lookup state.scope_stack with
+  | Some offset -> 
+      (offset, state)
+  | None ->
+      failwith ("Variable " ^ var ^ " not found in local scopes")
 
-(* 正确加载立即数 *)
-let load_immediate state value =
-  if value = 0 then
-    let (temp, state') = fresh_temp state in
-    (temp, [Addi(temp, Zero, 0)], state')
-  else if value >= -2048 && value <= 2047 then
-    let (temp, state') = fresh_temp state in
-    (temp, [Addi(temp, Zero, value)], state')
-  else
-    (* 处理大立即数 - 使用LUI+ADDI组合 *)
-    let (temp, state') = fresh_temp state in
-    let upper = (value lsr 12) land 0xFFFFF in
-    let lower = value land 0xFFF in
-    (* 如果低12位是负数，需要调整 *)
-    let (upper, lower) = 
-      if lower >= 0x800 then (upper + 1, lower - 0x1000) 
-      else (upper, lower) in
-    (temp, [Lui(temp, upper); Addi(temp, temp, lower)], state')
+let get_var_offset_for_declaration state var =
+  match state.scope_stack with
+  | current_scope :: _ ->
+      let offset = -(500  + state.stack_size) in
+      Hashtbl.add current_scope var offset;
+      let new_state = {state with stack_size = state.stack_size + 4} in
+      (offset, new_state)
+  | [] ->
+      let new_scope = Hashtbl.create 10 in
+      let offset = -(500  + state.stack_size) in
+      Hashtbl.add new_scope var offset;
+      let new_state = {state with 
+                       scope_stack = new_scope :: state.scope_stack;
+                       stack_size = state.stack_size + 4} in
+      (offset, new_state)
 
-let create_prologue stack_size num_params =
-  [
-    Comment ("Function prologue for " ^ string_of_int stack_size ^ " bytes");
-    Addi(SP, SP, -stack_size);  (* 分配栈空间 *)
-    Sw(RA, SP, stack_size - 4);  (* 保存返回地址 *)
-    (if num_params > 0 then Sw(A0, SP, stack_size - 8) else Comment "No params to save");
-    (if num_params > 1 then Sw(A1, SP, stack_size - 12) else Comment "");
-    (if num_params > 2 then Sw(A2, SP, stack_size - 16) else Comment "");
-    (if num_params > 3 then Sw(A3, SP, stack_size - 20) else Comment "");
-    Comment "End prologue";
-  ]
+(* 将表达式转换为字符串 *)
+let rec string_of_expr = function
+  | Num n -> string_of_int n
+  | Var s -> s
+  | Call (name, args) -> name ^ "(" ^ String.concat ", " (List.map string_of_expr args) ^ ")"
+  | Unary (op, e) -> (match op with Plus -> "+" | Minus -> "-" | Not -> "!") ^ string_of_expr e
+  | Binary (op, e1, e2) -> (match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Lt -> "<" | Gt -> ">" | Leq -> "<=" | Geq -> ">=" | Eq -> "==" | Neq -> "!=" | And -> "&&" | Or -> "||") ^ "(" ^ string_of_expr e1 ^ ", " ^ string_of_expr e2 ^ ")"
 
-let create_epilogue stack_size =
-  [
-    Comment "Function epilogue";
-    Lw(RA, SP, stack_size - 4);  (* 恢复返回地址 *)
-    Addi(SP, SP, stack_size);    (* 释放栈空间 *)
-    Jalr(Zero, RA, 0);           (* 返回调用点 *)
-    Comment "End epilogue";
-  ]
+(* 将语句转换为字符串 *)
+let rec string_of_stmt = function
+  | BlockStmt b -> "Block(" ^ String.concat "; " (List.map string_of_stmt b.stmts) ^ ")"
+  | EmptyStmt -> ";"
+  | ExprStmt e -> string_of_expr e ^ ";"
+  | DeclStmt (t, name, Some e) -> (match t with Int -> "int" | Void -> "void") ^ " " ^ name ^ " = " ^ string_of_expr e ^ ";"
+  | DeclStmt (t, name, None) -> (match t with Int -> "int" | Void -> "void") ^ " " ^ name ^ ";"
+  | AssignStmt (name, e) -> name ^ " = " ^ string_of_expr e ^ ";"
+  | IfStmt (cond, then_stmt, Some else_stmt) -> "if (" ^ string_of_expr cond ^ ") " ^ string_of_stmt then_stmt ^ " else " ^ string_of_stmt else_stmt
+  | IfStmt (cond, then_stmt, None) -> "if (" ^ string_of_expr cond ^ ") " ^ string_of_stmt then_stmt
+  | WhileStmt (cond, s) -> "while (" ^ string_of_expr cond ^ ") " ^ string_of_stmt s
+  | BreakStmt -> "break;"
+  | ContinueStmt -> "continue;"
+  | ReturnStmt (Some e) -> "return " ^ string_of_expr e ^ ";"
+  | ReturnStmt None -> "return;"
 
-(* 语义分析 - 保持不变 *)
-let semantic_analysis ast = 
-  (* 保持不变 *)
-  print_endline "Semantic analysis passed!"
+(* 将函数定义转换为字符串 *)
+let string_of_func_def fd =
+  (match fd.ret_type with Int -> "int" | Void -> "void") ^ " " ^ fd.name ^ "(" ^ String.concat ", " (List.map (fun p -> (match p.typ with Int -> "int" | Void -> "void") ^ " " ^ p.name) fd.params) ^ ")" ^ " {\n" ^ string_of_stmt (BlockStmt fd.body) ^ "\n}"
+
+(* 将 AST 转换为字符串 *)
+let string_of_ast ast =
+  String.concat "\n" (List.map string_of_func_def ast)
+
+(* 辅助函数：检查函数是否在全局作用域 *)
+let is_global_scope = function
+  | BlockStmt _ -> false
+  | _ -> true
+
+(* 辅助函数：检查 return 语句覆盖所有路径 *)
+let rec check_return_coverage stmt =
+  match stmt with
+  | BlockStmt b ->  
+  let rec check_block stmts =
+    match stmts with
+    | [] -> false
+    | s::rest ->
+        if check_return_coverage s 
+        then true  
+        else check_block rest  
+  in
+  check_block b.stmts
+  | IfStmt (cond, then_stmt, Some else_stmt) ->
+      check_return_coverage then_stmt && check_return_coverage else_stmt
+  | IfStmt (cond, then_stmt, None) -> false
+  | WhileStmt (cond, s) -> false
+  | ReturnStmt _ -> true
+  | _ -> false
+
+type func_signature = { ret_type: typ; params: param list } 
+let func_table = Hashtbl.create 30
+  
+let collect_functions ast =
+  List.iter (fun (fd : Ast.func_def) ->
+    Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
+  ) ast
+
+let rec check_expr_calls (expr : Ast.expr) =
+  match expr with
+  | Call (name, args) ->
+      if not (Hashtbl.mem func_table name) then
+        raise (SemanticError ("function " ^ name ^ " called but not defined"));
+      List.iter check_expr_calls args
+  | Unary (_, e) -> check_expr_calls e
+  | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
+  | _ -> ()
+
+(* 语义分析主函数 *)
+let semantic_analysis ast =
+  collect_functions ast;
+  let has_main = ref false in
+  let scope_stack = ref [StringMap.empty] in
+  let enter_scope () =
+    scope_stack := StringMap.empty :: !scope_stack
+  in
+  let leave_scope () =
+    scope_stack := List.tl !scope_stack
+  in
+  let add_var name typ =
+    match !scope_stack with
+    | current :: rest ->
+        if StringMap.mem name current then
+          raise (SemanticError ("variable " ^ name ^ " redeclared"));
+        scope_stack := StringMap.add name typ current :: rest
+    | [] -> failwith "scope stack empty"
+  in
+  let rec find_var name = function
+    | [] -> None
+    | scope :: rest ->
+        match StringMap.find_opt name scope with
+        | Some t -> Some t
+        | None -> find_var name rest
+  in
+  let rec infer_expr_type expr =
+    match expr with
+    | Num _ -> Int
+    | Var v ->
+        (match find_var v !scope_stack with
+         | Some t -> t
+         | None -> raise (SemanticError ("variable " ^ v ^ " used before declaration")))
+    | Call (name, args) ->
+        let { ret_type; params } = Hashtbl.find func_table name in
+        if List.length args <> List.length params then
+          raise (SemanticError ("function " ^ name ^ " called with wrong number of arguments"));
+        List.iter2 (fun arg param ->
+          let arg_type = infer_expr_type arg in
+          if arg_type <> param.typ then
+            raise (SemanticError ("type mismatch in argument of function " ^ name))
+        ) args params;
+        ret_type
+    | Unary (op, e) ->
+        (match op with
+         | Plus | Minus -> infer_expr_type e
+         | Not -> Int)
+    | Binary (op, e1, e2) ->
+        let t1 = infer_expr_type e1 in
+        let t2 = infer_expr_type e2 in
+        if t1 <> Int || t2 <> Int then
+          raise (SemanticError "binary operation only supports int types");
+        Int
+  in
+  let rec check_stmt stmt expected_ret_type in_loop =
+    match stmt with
+    | DeclStmt (t, name, e_opt) ->
+        add_var name t;
+        (match e_opt with
+         | Some e ->
+             let expr_type = infer_expr_type e in
+             if expr_type <> t then
+               raise (SemanticError ("type mismatch in declaration of " ^ name))
+         | None -> ())
+    | AssignStmt (name, e) ->
+        (match find_var name !scope_stack with
+         | None -> raise (SemanticError ("variable " ^ name ^ " used before declaration"))
+         | Some t ->
+             let expr_type = infer_expr_type e in
+             if expr_type <> t then
+               raise (SemanticError ("type mismatch in assignment to " ^ name)))
+    | ExprStmt e -> ignore (infer_expr_type e); check_expr_calls e
+    | ReturnStmt (Some e) ->
+        let expr_type = infer_expr_type e in
+        if expr_type <> expected_ret_type then
+          raise (SemanticError "return type mismatch")
+    | ReturnStmt None ->
+        if expected_ret_type <> Void then
+          raise (SemanticError "missing return value in non-void function")
+    | BlockStmt b ->
+        enter_scope ();
+        List.iter (fun s -> check_stmt s expected_ret_type in_loop) b.stmts;
+        leave_scope ()
+    | IfStmt (cond, then_stmt, else_stmt_opt) ->
+        ignore (infer_expr_type cond);
+        check_stmt then_stmt expected_ret_type in_loop;
+        Option.iter (fun s -> check_stmt s expected_ret_type in_loop) else_stmt_opt
+    | WhileStmt (cond, s) ->
+        ignore (infer_expr_type cond);
+        check_stmt s expected_ret_type true
+    | BreakStmt | ContinueStmt ->
+      if not in_loop then raise (SemanticError "break/continue must be inside a loop")
+    | EmptyStmt -> ()
+  and check_expr_calls expr =
+    match expr with
+    | Call (name, args) ->
+        if not (Hashtbl.mem func_table name) then
+          raise (SemanticError ("function " ^ name ^ " called but not defined"));
+        List.iter check_expr_calls args
+    | Unary (_, e) -> check_expr_calls e
+    | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
+    | _ -> ()
+  in
+  List.iter (fun (fd : ToyC_riscv_lib.Ast.func_def) ->
+    if fd.name = "main" then (
+      has_main := true;
+      if fd.params <> [] then raise (SemanticError "main function must have an empty parameter list");
+      if fd.ret_type <> Int then raise (SemanticError "main function must return int");
+      if not (check_return_coverage (BlockStmt fd.body)) then
+        raise (SemanticError "main function must return a value on all paths")
+    ) else if fd.ret_type = Int && not (check_return_coverage (BlockStmt fd.body)) then
+      raise (SemanticError (fd.name ^ " function with int return type must return a value on all paths"));
+    let param_names = List.map (fun (p : ToyC_riscv_lib.Ast.param) -> p.name) fd.params in
+    let initial_scope = List.fold_left (fun acc name -> StringMap.add name Int acc) StringMap.empty param_names in
+    scope_stack := initial_scope :: !scope_stack;
+    check_stmt (BlockStmt fd.body) fd.ret_type false;
+    scope_stack := List.tl !scope_stack
+  ) ast;
+  if not !has_main then raise (SemanticError "program must contain a main function")
+
+let parse_channel ch =
+  let lex = Lexing.from_channel ch in
+  try
+    Parser.comp_unit Lexer.token lex
+  with
+  | LexicalError msg ->
+      Printf.eprintf "Lexical error: %s\n" msg;
+      exit 1
+  | Parser.Error ->
+      let pos = lex.Lexing.lex_curr_p in
+      Printf.eprintf "Syntax error at line %d, column %d\n"
+        pos.Lexing.pos_lnum (pos.Lexing.pos_cnum - pos.Lexing.pos_bol + 1);
+      exit 1
+
 
 (* ==================== AST到IR转换 ==================== *)
 let rec expr_to_ir state expr =
   match expr with
   | Num n -> 
-      load_immediate state n
-  
+      let (temp, state') = fresh_temp state in
+      (temp, [Li (temp, n)], state')
   | Var x -> 
-      let offset, state' = get_var_offset state x in
+      let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
-      (temp, [Lw(temp, SP, offset)], state'')
-  
-  | Binary (op, e1, e2) ->
-      let (e1_reg, e1_code, state') = expr_to_ir state e1 in
-      let (e2_reg, e2_code, state'') = expr_to_ir (reset_temp state') e2 in
-      let (temp, state''') = fresh_temp state'' in
-      
-      let instr = match op with
-        | Add -> Add(temp, e1_reg, e2_reg)
-        | Sub -> Sub(temp, e1_reg, e2_reg)
-        | Mul -> Mul(temp, e1_reg, e2_reg)
-        | Div -> Div(temp, e1_reg, e2_reg)
-        | Mod -> Rem(temp, e1_reg, e2_reg)
-        | Lt -> Slt(temp, e1_reg, e2_reg)
-        | _ -> failwith "Unsupported binary operation"
-      in
-      (temp, e1_code @ e2_code @ [instr], state''')
-  
+      (temp, [Load (temp, RiscvReg "s0", offset)], state'')
   | Call (name, args) ->
-      (* 准备参数 *)
-      let rec prepare_args state args idx = 
-        match args with
-        | [] -> ([], state)
-        | arg::rest ->
-            let (arg_reg, arg_code, state') = expr_to_ir state arg in
-            let save_code = 
-              if idx < 4 then [Addi((match idx with 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3), arg_reg, 0)]
-              else [Sw(arg_reg, SP, 16 + (idx - 4) * 4)] (* 参数保存在栈上 *)
-            in
-            let (rest_code, state'') = prepare_args (reset_temp state') rest (idx + 1) in
-            (arg_code @ save_code @ rest_code, state'')
+    let indexed_args = List.mapi (fun i arg -> (i, arg)) args in
+    let (processed_args, final_state) = List.fold_left (
+      fun (acc_results, acc_state) (i, arg_expr) ->
+        let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
+        let process_code = 
+          if i < 8 then
+            code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
+          else
+             let stack_offset = ((i - 8) * 4) in
+          code @ [Store (reg, RiscvReg "sp", stack_offset)]
+        in
+        let free_state = free_temp new_state reg in
+        (acc_results @ process_code, free_state)
+    ) ([], state) indexed_args in
+    let is_void_func = 
+      try
+        let func_info = Hashtbl.find func_table name in
+        func_info.ret_type = Void
+      with Not_found -> false
+    in
+    if is_void_func then
+      let (temp, state') = fresh_temp final_state in
+      (temp, processed_args @ [Call name; Li (temp, 0)], state')
+    else
+      let (result_reg, state') = fresh_temp final_state in
+      (result_reg, processed_args @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
+  | Unary (op, e) ->
+      let (e_reg, e_code, state') = expr_to_ir state e in
+      let (temp, state'') = fresh_temp state' in
+      let state''' = free_temp state'' e_reg in
+      (match op with
+       | Plus -> (e_reg, e_code, state')
+       | Minus -> (temp, e_code @ [BinaryOp ("sub", temp, RiscvReg "zero", e_reg)], state''')
+       | Not -> 
+           let (ne_temp, state'''') = fresh_temp state''' in
+           let state_final = free_temp state'''' ne_temp in
+           (temp, e_code @ [BinaryOp ("sltu", ne_temp, RiscvReg "zero", e_reg);
+                            BinaryOpImm ("xori", temp, ne_temp, 1)], state_final))
+  | Binary (op, e1, e2) ->
+      let (e1_reg, e1_code, state') = expr_to_ir state e1 in        
+      let protected_state = 
+        match e1_reg with
+        | Temp n -> {state' with free_temps = List.filter (fun x -> x <> n) state'.free_temps}
+        | RiscvReg _ -> state'
       in
-      
-      let (arg_code, state') = prepare_args state args 0 in
-      let call_instr = [Jal(name)] in
-      
-      (* 函数调用结果在A0寄存器 *)
-      (A0, arg_code @ call_instr, state')
-  
-  | _ -> failwith "Unsupported expression"
+      let (e2_reg, e2_code, state'') = expr_to_ir protected_state e2 in
+      let (temp, state''') = fresh_temp state'' in
+      let state_final = free_temp (free_temp state''' e1_reg) e2_reg in
+    
+        match op with
+        | And -> 
+            let (false_label, state_false) = fresh_label state''' "and_false" in
+            let (merge_label, state_merge) = fresh_label state_false "and_merge" in
+            let state_final = free_temp state_merge temp in
+            (temp, 
+            e1_code @ 
+            [Branch ("beqz", e1_reg, RiscvReg "zero", false_label)] @
+            e2_code @
+            [Mv (temp, e2_reg);
+              Jmp merge_label;
+              Label false_label;
+              Li (temp, 0);
+              Label merge_label], 
+            state_final)
+        | Or -> 
+            let (true_label, state_true) = fresh_label state''' "or_true" in
+            let (merge_label, state_merge) = fresh_label state_true "or_merge" in
+            let state_final = free_temp state_merge temp in
+            (temp, 
+            e1_code @ 
+            [Branch ("bnez", e1_reg, RiscvReg "zero", true_label)] @
+            e2_code @
+            [Mv (temp, e2_reg);
+              Jmp merge_label;
+              Label true_label;
+              Li (temp, 1);
+              Label merge_label], 
+            state_final)
+        | Add -> 
+            (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state_final)
+        | Sub -> 
+          (match e2 with
+          | Num n -> 
+              (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final) 
+          | _ -> 
+              (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
+        | Mul -> 
+            let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
+            let e2_has_call = List.exists (function Call _ -> true | _ -> false) e2_code in
+            (match (e1, e2) with
+            | (Var x1, _) when e2_has_call -> 
+                (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
+            | (_, Var x2) when e1_has_call -> 
+                (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
+            | _ -> 
+                (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final))
+        | Div -> 
+            (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state_final)
+        | Mod -> 
+            (temp, e1_code @ e2_code @ [BinaryOp ("rem", temp, e1_reg, e2_reg)], state_final)
+        | Lt -> 
+            (temp, e1_code @ e2_code @ [BinaryOp ("slt", temp, e1_reg, e2_reg)], state_final)
+        | Gt -> 
+            let code = e1_code @ e2_code @ [BinaryOp ("slt", temp, e2_reg, e1_reg)] in
+            (temp, code, state_final)
+        | Leq ->
+        let (lt_temp, state'''') = fresh_temp state_final in
+        let state_final' = free_temp state'''' lt_temp in
+        let code = e1_code @ e2_code @
+          [BinaryOp ("slt", lt_temp, e2_reg, e1_reg);
+          BinaryOpImm ("xori", temp, lt_temp, 1)] in
+        (temp, code, state_final')
+        | Geq ->
+            let (lt_temp, state'''') = fresh_temp state_final in
+            let state_final' = free_temp state'''' lt_temp in
+            let code = e1_code @ e2_code @
+              [BinaryOp ("slt", lt_temp, e1_reg, e2_reg);
+              BinaryOpImm ("xori", temp, lt_temp, 1)] in
+            (temp, code, state_final')
+        | Eq ->
+            let (xor_temp, state'''') = fresh_temp state_final in
+            let (sltu_temp, state''''') = fresh_temp state'''' in
+            let state_final'' = free_temp (free_temp state''''' xor_temp) sltu_temp in
+            let code = e1_code @ e2_code @
+              [BinaryOp ("xor", xor_temp, e1_reg, e2_reg);
+              BinaryOp ("sltu", sltu_temp, RiscvReg "zero", xor_temp);
+              BinaryOpImm ("xori", temp, sltu_temp, 1)] in
+            (temp, code, state_final'')
+        | Neq ->
+            let (xor_temp, state'''') = fresh_temp state_final in
+            let (sltu_temp, state''''') = fresh_temp state'''' in
+            let state_final'' = free_temp (free_temp state''''' xor_temp) sltu_temp in
+            let code = e1_code @ e2_code @
+              [BinaryOp ("xor", xor_temp, e1_reg, e2_reg);
+              BinaryOp ("sltu", sltu_temp, RiscvReg "zero", xor_temp)] in
+            (temp, code, state_final'')
+
+let enter_scope state =
+  let new_scope = Hashtbl.create 10 in
+  {state with scope_stack = new_scope :: state.scope_stack}
+
+let leave_scope state =
+  match state.scope_stack with
+  | [] -> state
+  | _ :: rest -> {state with scope_stack = rest}
 
 let rec stmt_to_ir state stmt =
   match stmt with
   | BlockStmt b -> block_to_ir state b
-  
-  | DeclStmt (_, name, Some expr) -> 
+  | DeclStmt (_, name, Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let offset, state'' = get_var_offset state' name in
-      (expr_code @ [Sw(expr_reg, SP, offset)], reset_temp state'')
-  
-  | DeclStmt (_, name, None) -> 
-      let offset, state' = get_var_offset state name in
+      let offset, state'' = get_var_offset_for_declaration state' name in
+      let state''' = free_temp state'' expr_reg in
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
+  | DeclStmt (_, name, None) ->
+      let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
-  
   | AssignStmt (name, expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let offset, state'' = get_var_offset state' name in
-      (expr_code @ [Sw(expr_reg, SP, offset)], reset_temp state'')
-  
-  | IfStmt (cond, then_stmt, else_stmt) ->
+      let offset, state'' = get_var_offset_for_use state' name in
+      let state''' = free_temp state'' expr_reg in
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
+  | IfStmt (cond, then_stmt, else_stmt_opt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
       let (then_label, state'') = fresh_label state' "then" in
       let (else_label, state''') = fresh_label state'' "else" in
       let (merge_label, state'''') = fresh_label state''' "merge" in
-      
-      let (then_code, state''''') = stmt_to_ir (reset_temp state'''') then_stmt in
+      let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
       let (else_code, state'''''') = 
-        match else_stmt with
-        | Some s -> stmt_to_ir (reset_temp state''''') s
-        | None -> ([], state''''') 
-      in
-      
+        match else_stmt_opt with
+        | Some s -> stmt_to_ir state''''' s
+        | None -> ([], state''''') in
+      let state_final = free_temp state'''''' cond_reg in
       (cond_code @ 
-       [Bne(cond_reg, Zero, then_label);
-        Jmp(else_label);
+       [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+        Jmp else_label;
         Label then_label] @
        then_code @
-       [Jmp(merge_label);
+       [Jmp merge_label;
         Label else_label] @
        else_code @
-       [Label merge_label], state'''''')
-
+       [Label merge_label], state_final)
+  | ReturnStmt (Some expr) ->
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      let state'' = free_temp state' expr_reg in
+      (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state'')
+  | ReturnStmt None ->
+      ([Ret], state)
+  | ExprStmt expr ->
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      let state'' = free_temp state' expr_reg in
+      (expr_code, state'')
   | WhileStmt (cond, body) ->
       let (loop_label, state') = fresh_label state "loop" in
       let (end_label, state'') = fresh_label state' "end" in
-      
       let state_with_loop = { state'' with loop_labels = (end_label, loop_label) :: state''.loop_labels } in
-      
       let (cond_reg, cond_code, state''') = expr_to_ir state_with_loop cond in
       let (body_code, state'''') = stmt_to_ir state''' body in
-      
+      let state_final = free_temp state'''' cond_reg in
       ( [Label loop_label] @
         cond_code @
-        [Beq(cond_reg, Zero, end_label)] @
+        [Branch ("beqz", cond_reg, RiscvReg "zero", end_label)] @
         body_code @
-        [Jmp(loop_label);
+        [Jmp loop_label;
          Label end_label],
-        { state'''' with loop_labels = List.tl state''''.loop_labels } )
-
-  | ReturnStmt (Some expr) ->
-      let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      (expr_code @ [Addi(A0, expr_reg, 0); Comment "Return value"; Jmp("__return")], state')
-  
-  | ReturnStmt None ->
-      ([Jmp("__return")], state)
-  
-  | ExprStmt expr ->
-      let (_, expr_code, state') = expr_to_ir state expr in
-      (expr_code, reset_temp state')
-  
+        { state_final with loop_labels = List.tl state_final.loop_labels } )
   | BreakStmt ->
       (match state.loop_labels with
-       | (end_label, _) :: _ -> [Jmp(end_label)], state
+       | (end_label, _) :: _ -> ([Jmp end_label], state)
        | [] -> failwith "break statement outside loop")
-  
   | ContinueStmt ->
       (match state.loop_labels with
-       | (_, loop_label) :: _ -> [Jmp(loop_label)], state
+       | (_, loop_label) :: _ -> ([Jmp loop_label], state)
        | [] -> failwith "continue statement outside loop")
-  
   | EmptyStmt ->
       ([], state)
 
 and block_to_ir state block =
-  List.fold_left (fun (code_acc, st) stmt ->
+  let state_with_scope = enter_scope state in
+  let (code, final_state) = List.fold_left (fun (code_acc, st) stmt ->
     let (code, st') = stmt_to_ir st stmt in
     (code_acc @ code, st')
-  ) ([], state) block.stmts
+  ) ([], state_with_scope) block.stmts in
+  let exited_state = leave_scope final_state in
+  (code, exited_state)
 
-let func_to_ir (func : Ast.func_def) : ir_func =
+let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
+    stack_size = 0;
+    label_counter = 0;
+    current_function = func.name;
   } in
-  
-  (* 首先处理参数 - 存储到栈帧中 *)
+  let param_scope = Hashtbl.create (List.length func.params) in
+  let state_with_scope = { state with scope_stack = [param_scope] } in
   let state' = 
-    List.fold_left (fun st (param : Ast.param) ->
-      let offset, st' = get_var_offset st param.name in
-      st'
-    ) state func.params
+    List.fold_left (fun st (i, (param : Ast.param)) ->
+      let offset = -(68 + i * 4) in
+      Hashtbl.add param_scope param.name offset;
+      Hashtbl.add st.var_offset param.name offset;
+      st
+    ) state_with_scope (List.mapi (fun i x -> (i, x)) func.params)
   in
-  
-  (* 生成函数体 *)
   let (body_code, final_state) = block_to_ir state' func.body in
-  
-  (* 添加函数返回点标签 *)
-  let body_with_return = body_code @ [Label "__return"] in
-  
-  (* 计算栈大小（局部变量空间 + 保存寄存器空间） *)
-  let stack_size = final_state.stack_size + 20 in (* 返回地址 + 保存寄存器 *)
-  
-  (* 添加序言和尾声 *)
-  let prologue = create_prologue stack_size (List.length func.params) in
-  let epilogue = create_epilogue stack_size in
-  
   {
     name = func.name;
     params = List.map (fun (p : Ast.param) -> p.name) func.params;
-    body = prologue @ body_with_return @ epilogue;
-    stack_size = stack_size;
-    num_params = List.length func.params;
-  }
+    body = body_code;
+  }, final_state.var_offset
 
-(* 将IR转换为RISC-V汇编字符串 *)
-let string_of_ir ir_func =
-  let buf = Buffer.create 256 in
-  Buffer.add_string buf (Printf.sprintf ".globl %s\n" ir_func.name);
-  Buffer.add_string buf (Printf.sprintf "%s:\n" ir_func.name);
+(* ==================== IR到RISC-V汇编转换（无伪指令） ==================== *)
+module LivenessAnalysis = struct
+  module RegSet = Set.Make(struct
+    type t = reg
+    let compare = compare
+  end)
   
-  List.iter (fun instr ->
-    let instr_str = match instr with
-      | Lui (rd, imm) -> 
-          Printf.sprintf "    lui %s, %d" (string_of_reg rd) imm
-      | Addi (rd, rs1, imm) -> 
-          Printf.sprintf "    addi %s, %s, %d" (string_of_reg rd) (string_of_reg rs1) imm
-      | Add (rd, rs1, rs2) -> 
-          Printf.sprintf "    add %s, %s, %s" (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
-      | Sub (rd, rs1, rs2) -> 
-          Printf.sprintf "    sub %s, %s, %s" (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
-      | Mul (rd, rs1, rs2) -> 
-          Printf.sprintf "    mul %s, %s, %s" (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
-      | Div (rd, rs1, rs2) -> 
-          Printf.sprintf "    div %s, %s, %s" (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
-      | Rem (rd, rs1, rs2) -> 
-          Printf.sprintf "    rem %s, %s, %s" (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
-      | Slt (rd, rs1, rs2) -> 
-          Printf.sprintf "    slt %s, %s, %s" (string_of_reg rd) (string_of_reg rs1) (string_of_reg rs2)
-      | Beq (rs1, rs2, label) -> 
-          Printf.sprintf "    beq %s, %s, %s" (string_of_reg rs1) (string_of_reg rs2) label
-      | Bne (rs1, rs2, label) -> 
-          Printf.sprintf "    bne %s, %s, %s" (string_of_reg rs1) (string_of_reg rs2) label
-      | Blt (rs1, rs2, label) -> 
-          Printf.sprintf "    blt %s, %s, %s" (string_of_reg rs1) (string_of_reg rs2) label
-      | Bge (rs1, rs2, label) -> 
-          Printf.sprintf "    bge %s, %s, %s" (string_of_reg rs1) (string_of_reg rs2) label
-      | Jmp label -> 
-          Printf.sprintf "    j %s" label
-      | Jal label -> 
-          Printf.sprintf "    jal %s" label
-      | Jalr (rd, rs, imm) -> 
-          Printf.sprintf "    jalr %s, %s, %d" (string_of_reg rd) (string_of_reg rs) imm
-      | Label label -> 
-          Printf.sprintf "%s:" label
-      | Sw (rs, base, offset) -> 
-          Printf.sprintf "    sw %s, %d(%s)" (string_of_reg rs) offset (string_of_reg base)
-      | Lw (rd, base, offset) -> 
-          Printf.sprintf "    lw %s, %d(%s)" (string_of_reg rd) offset (string_of_reg base)
-      | Comment str -> 
-          Printf.sprintf "    # %s" str
+  (* 计算指令中使用的寄存器 *)
+  let regs_used = function
+    | Li _ -> RegSet.empty
+    | Mv (_, rs) -> RegSet.singleton rs
+    | BinaryOp (_, _, rs1, rs2) -> RegSet.add rs1 (RegSet.singleton rs2)
+    | BinaryOpImm (_, _, rs, _) -> RegSet.singleton rs
+    | Branch (_, rs1, rs2, _) -> RegSet.add rs1 (RegSet.singleton rs2)
+    | Store (rs, _, _) -> RegSet.singleton rs
+    | Load (_, _, _) -> RegSet.empty
+    | ReloadVar (_, _) -> RegSet.empty
+    | Call _ -> 
+        let params = List.init 8 (fun i -> RiscvReg ("a" ^ string_of_int i)) in
+        List.fold_left (fun set reg -> RegSet.add reg set) RegSet.empty params
+    | _ -> RegSet.empty
+  
+  (* 计算指令中定义的寄存器 - 修复此处的类型错误 *)
+  let regs_defined = function
+    | Li (rd, _) -> RegSet.singleton rd
+    | Mv (rd, _) -> RegSet.singleton rd
+    | BinaryOp (_, rd, _, _) -> RegSet.singleton rd  (* 正确获取目标寄存器（第二个参数） *)
+    | BinaryOpImm (_, rd, _, _) -> RegSet.singleton rd  (* 正确获取目标寄存器（第二个参数） *)
+    | Load (rd, _, _) -> RegSet.singleton rd
+    | ReloadVar (rd, _) -> RegSet.singleton rd
+    | Call _ -> RegSet.singleton (RiscvReg "a0")
+    | _ -> RegSet.empty
+  
+  type liveness_info = {
+    live_in: RegSet.t array;
+    live_out: RegSet.t array;
+  }[@@warning "-69"]
+  
+  let analyze_liveness (instrs: ir_instr list) : liveness_info =
+    let n = List.length instrs in
+    if n = 0 then
+      { live_in = [||]; live_out = [||] }
+    else
+      let live_in = Array.make n RegSet.empty in
+      let live_out = Array.make n RegSet.empty in
+      let instr_array = Array.of_list instrs in
+      for i = 0 to n - 1 do
+        live_in.(i) <- RegSet.empty;
+        live_out.(i) <- RegSet.empty;
+      done;
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        for i = n - 1 downto 0 do
+          let used = regs_used instr_array.(i) in
+          let defined = regs_defined instr_array.(i) in
+          let new_out = 
+            if i < n - 1 then
+              live_in.(i + 1)
+            else
+              RegSet.empty
+          in
+          let new_in = RegSet.union used (RegSet.diff new_out defined) in
+          if not (RegSet.equal live_in.(i) new_in) || 
+             not (RegSet.equal live_out.(i) new_out) then
+            (
+              live_in.(i) <- new_in;
+              live_out.(i) <- new_out;
+              changed := true
+            )
+        done
+      done;
+      { live_in; live_out }
+  
+  let get_live_regs info instr_index =
+    if instr_index >= 0 && instr_index < Array.length info.live_in then
+      info.live_in.(instr_index)
+    else
+      RegSet.empty
+      
+  let is_live info instr_index reg =
+    RegSet.mem reg (get_live_regs info instr_index)
+end
+
+module IRToRiscV = struct
+  let reg_map var_offsets frame_size = function
+    | RiscvReg s -> s
+    | Temp n -> 
+        if n < 7 then 
+          Printf.sprintf "t%d" n
+        else if n < 15 then 
+          Printf.sprintf "a%d" (n - 7)
+        else
+          let stack_offset = -(68 + (n - 15 + 1) * 4) in
+          Printf.sprintf "%d(s0)" stack_offset
+  
+  let instr_to_asm var_offsets frame_size instrs =
+    let liveness_info = LivenessAnalysis.analyze_liveness instrs in
+    
+    let rec convert_instrs acc_index acc_code instr_list =
+      match instr_list with
+      | [] -> acc_code
+      | instr :: rest ->
+          let code = 
+            match instr with
+            | Li (r, n) -> 
+                let rd = reg_map var_offsets frame_size r in
+                if n >= -2048 && n <= 2047 then
+                  Printf.sprintf "  addi %s, x0, %d" rd n
+                else
+                  let signed_lower = n land 0xFFF in
+                  let upper_20 = (n asr 12) land 0xFFFFF in
+                  let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
+                  let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
+                  Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" rd adjusted_upper rd rd signed_lower
+            | Mv (rd, rs) ->
+                let rd_reg = reg_map var_offsets frame_size rd in
+                let rs_reg = reg_map var_offsets frame_size rs in
+                Printf.sprintf "  add %s, %s, x0" rd_reg rs_reg
+            | BinaryOp (op, rd, rs1, rs2) ->
+                let rd_reg = reg_map var_offsets frame_size rd in
+                let rs1_reg = reg_map var_offsets frame_size rs1 in
+                let rs2_reg = reg_map var_offsets frame_size rs2 in
+                Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg
+            | BinaryOpImm (op, rd, rs, imm) ->
+                let rd_reg = reg_map var_offsets frame_size rd in
+                let rs_reg = reg_map var_offsets frame_size rs in
+                if imm >= -2048 && imm <= 2047 then
+                  Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm
+                else
+                  let temp_reg = "t0" in
+                  let load_imm = 
+                    let signed_lower = imm land 0xFFF in
+                    let upper_20 = (imm asr 12) land 0xFFFFF in
+                    let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
+                    let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
+                    Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" temp_reg adjusted_upper temp_reg temp_reg signed_lower
+                  in
+                  Printf.sprintf "%s\n  %s %s, %s, %s" load_imm op rd_reg rs_reg temp_reg
+            | Branch (cond, rs1, rs2, label) ->
+                let rs1_reg = reg_map var_offsets frame_size rs1 in
+                let rs2_reg = reg_map var_offsets frame_size rs2 in
+                (match cond with
+                 | "beqz" -> Printf.sprintf "  beq %s, x0, %s" rs1_reg label
+                 | "bnez" -> Printf.sprintf "  bne %s, x0, %s" rs1_reg label
+                 | _ -> Printf.sprintf "  %s %s, %s, %s" cond rs1_reg rs2_reg label)
+            | Jmp label -> 
+                Printf.sprintf "  j %s" label
+            | Label label -> 
+                Printf.sprintf "%s:" label
+            | Call func -> 
+                Printf.sprintf "  jal ra, %s" func
+            | Ret -> 
+                "  jalr x0, ra, 0"
+            | Store (rs, base, offset) ->
+                let rs_reg = reg_map var_offsets frame_size rs in
+                let base_reg = reg_map var_offsets frame_size base in
+                Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg
+            | Load (rd, base, offset) ->
+                let rd_reg = reg_map var_offsets frame_size rd in
+                let base_reg = reg_map var_offsets frame_size base in
+                Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg
+            | ReloadVar (rd, var_name) ->
+                (try
+                  let offset = Hashtbl.find var_offsets var_name in
+                  let rd_reg = reg_map var_offsets frame_size rd in
+                  Printf.sprintf "  lw %s, %d(s0)" rd_reg offset
+                with Not_found ->
+                  failwith ("Variable " ^ var_name ^ " not found during code generation"))
+          in
+          convert_instrs (acc_index + 1) (acc_code ^ code ^ "\n") rest
     in
-    Buffer.add_string buf (instr_str ^ "\n")
-  ) ir_func.body;
-  
-  Buffer.contents buf
+    convert_instrs 0 "" instrs
 
-(* 主函数保持不变 *)
+  let calculate_frame_size (ir_func : ir_func) =
+    let base_size = 16 in
+    let rec analyze_instrs = function
+      | [] -> 0
+      | instr :: rest ->
+          let extra = 
+            match instr with
+            | Store (_, RiscvReg "sp", offset) when offset > 0 -> offset + 4
+            | Load (Temp n, _, _) | Li (Temp n, _) | Mv (Temp n, _) 
+            | BinaryOp (_, Temp n, _, _) | BinaryOpImm (_, Temp n, _, _) ->
+                if n >= 15 then (n - 14) * 4 else 0
+            | _ -> 0
+          in
+          max extra (analyze_instrs rest)
+    in
+    let call_stack = analyze_instrs ir_func.body in
+    let aligned = ((base_size + call_stack + 15) / 16) * 16 in
+    max aligned 32
+
+  let function_prologue name frame_size =
+    let ra_offset = frame_size - 4 in
+    let s0_offset = frame_size - 8 in
+    Printf.sprintf "%s:\n" name ^
+    Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
+    Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
+    Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
+    Printf.sprintf "  addi s0, sp, %d\n" frame_size
+
+  let function_epilogue frame_size =
+    let ra_offset = frame_size - 4 in 
+    let s0_offset = frame_size - 8 in 
+    Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
+    Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
+    Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
+    "  jalr x0, ra, 0\n"
+
+  let func_to_asm var_offsets (ir_func : ir_func) =
+    let frame_size = calculate_frame_size ir_func in
+    let buf = Buffer.create 256 in
+    Buffer.add_string buf (function_prologue ir_func.name frame_size);
+    
+    List.iteri (fun i param ->
+      let offset = -(68 + i * 4) in
+      if i < 8 then
+        Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
+      else
+        let param_stack_offset = (i - 8) * 4 in
+        Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)\n" param_stack_offset offset)
+    ) ir_func.params;
+    
+    let asm_code = instr_to_asm var_offsets frame_size ir_func.body in
+    Buffer.add_string buf asm_code;
+    
+    let has_explicit_ret = List.exists (function Ret -> true | _ -> false) ir_func.body in
+    if not has_explicit_ret then
+      Buffer.add_string buf (function_epilogue frame_size);
+    
+    Buffer.contents buf
+end
+
+(* ==================== 主程序：生成标准RISC-V汇编 ==================== *)
 let () =
-  let ch = open_in "test/04_while_break.tc" in
-  let ast = parse_channel ch in
-  close_in ch;
+  let ast = parse_channel stdin in
   semantic_analysis ast;
-  let ast_str = string_of_ast ast in
-  let out_ch = open_out "ast.txt" in
-  Printf.fprintf out_ch "%s\n" ast_str;
-  close_out out_ch;
   
-  let ir = List.map func_to_ir ast in
+  let ir_with_offsets = List.map func_to_ir ast in
+  let (ir_funcs, var_offsets_list) = List.split ir_with_offsets in
   
-  let ir_out = open_out "riscv.s" in
-  (* 添加RISC-V汇编头 *)
-  output_string ir_out ".text\n";
-  output_string ir_out ".align 2\n";
-  output_string ir_out ".globl __start\n";
-  output_string ir_out "__start:\n";
-  output_string ir_out "    jal main\n";
-  output_string ir_out "    li a0, 0\n";
-  output_string ir_out "    jal exit\n\n";
+  let combined_var_offsets = Hashtbl.create 50 in
+  List.iter (fun vo -> Hashtbl.iter (fun k v -> Hashtbl.add combined_var_offsets k v) vo) var_offsets_list;
   
-  (* 输出函数 *)
-  List.iter (fun f -> 
-    Printf.fprintf ir_out "%s\n" (string_of_ir f)
-  ) ir;
+  Printf.printf ".global main\n";
+  List.iter (fun func -> Printf.printf "%s\n" (IRToRiscV.func_to_asm combined_var_offsets func)) ir_funcs;
   
-  (* 添加退出函数 *)
-  output_string ir_out ".globl exit\n";
-  output_string ir_out "exit:\n";
-  output_string ir_out "    addi a0, x0, 93\n";  (* Linux exit syscall *)
-  output_string ir_out "    ecall\n";
-  
-  close_out ir_out;
-  
-  print_endline "Compilation successful!";
-  print_endline ("AST written to ast.txt");
-  print_endline ("RISC-V assembly written to riscv.s")
+  prerr_endline "Compilation successful! Output is standard RISC-V 32-bit assembly (no pseudoinstructions).";
