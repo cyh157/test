@@ -55,17 +55,17 @@ let initial_state = {
 
 (* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
-  match state.free_temps with
-  | temp :: rest -> 
-      (Temp temp, {state with free_temps = rest})
-  | [] -> 
-      let temp = state.temp_counter in
-      (Temp temp, {state with temp_counter = temp + 1})
+  if state.temp_counter < 26 then  (* 限制在26个寄存器内 *)
+    let temp = state.temp_counter in
+    (Temp temp, {state with temp_counter = temp + 1})
+  else
+    let stack_var = state.stack_size + 1 in
+    (Temp stack_var, {state with stack_size = state.stack_size + 4})
 
 let free_temp state temp_reg = 
   match temp_reg with
-  | Temp n -> {state with free_temps = n :: state.free_temps}
-  | RiscvReg _ -> state
+  | Temp n when n < 26 -> {state with free_temps = n :: state.free_temps}
+  | _ -> state
 
 let fresh_label state prefix =
   let label = Printf.sprintf "%s_%s%d" state.current_function prefix state.label_counter in
@@ -411,15 +411,7 @@ let rec expr_to_ir state expr =
           | _ -> 
               (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
         | Mul -> 
-            let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
-            let e2_has_call = List.exists (function Call _ -> true | _ -> false) e2_code in
-            (match (e1, e2) with
-            | (Var x1, _) when e2_has_call -> 
-                (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
-            | (_, Var x2) when e1_has_call -> 
-                (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
-            | _ -> 
-                (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final))
+            (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
         | Div -> 
             (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state_final)
         | Mod -> 
@@ -576,178 +568,142 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   }, final_state.var_offset
 
 (* ==================== IR到RISC-V汇编转换（无伪指令） ==================== *)
-module LivenessAnalysis = struct
-  module RegSet = Set.Make(struct
-    type t = reg
-    let compare = compare
-  end)
-  
-  (* 计算指令中使用的寄存器 *)
-  let regs_used = function
-    | Li _ -> RegSet.empty
-    | Mv (_, rs) -> RegSet.singleton rs
-    | BinaryOp (_, _, rs1, rs2) -> RegSet.add rs1 (RegSet.singleton rs2)
-    | BinaryOpImm (_, _, rs, _) -> RegSet.singleton rs
-    | Branch (_, rs1, rs2, _) -> RegSet.add rs1 (RegSet.singleton rs2)
-    | Store (rs, _, _) -> RegSet.singleton rs
-    | Load (_, _, _) -> RegSet.empty
-    | ReloadVar (_, _) -> RegSet.empty
-    | Call _ -> 
-        let params = List.init 8 (fun i -> RiscvReg ("a" ^ string_of_int i)) in
-        List.fold_left (fun set reg -> RegSet.add reg set) RegSet.empty params
-    | _ -> RegSet.empty
-  
-  (* 计算指令中定义的寄存器 - 修复此处的类型错误 *)
-  let regs_defined = function
-    | Li (rd, _) -> RegSet.singleton rd
-    | Mv (rd, _) -> RegSet.singleton rd
-    | BinaryOp (_, rd, _, _) -> RegSet.singleton rd  (* 正确获取目标寄存器（第二个参数） *)
-    | BinaryOpImm (_, rd, _, _) -> RegSet.singleton rd  (* 正确获取目标寄存器（第二个参数） *)
-    | Load (rd, _, _) -> RegSet.singleton rd
-    | ReloadVar (rd, _) -> RegSet.singleton rd
-    | Call _ -> RegSet.singleton (RiscvReg "a0")
-    | _ -> RegSet.empty
-  
-  type liveness_info = {
-    live_in: RegSet.t array;
-    live_out: RegSet.t array;
-  }[@@warning "-69"]
-  
-  let analyze_liveness (instrs: ir_instr list) : liveness_info =
-    let n = List.length instrs in
-    if n = 0 then
-      { live_in = [||]; live_out = [||] }
-    else
-      let live_in = Array.make n RegSet.empty in
-      let live_out = Array.make n RegSet.empty in
-      let instr_array = Array.of_list instrs in
-      for i = 0 to n - 1 do
-        live_in.(i) <- RegSet.empty;
-        live_out.(i) <- RegSet.empty;
-      done;
-      let changed = ref true in
-      while !changed do
-        changed := false;
-        for i = n - 1 downto 0 do
-          let used = regs_used instr_array.(i) in
-          let defined = regs_defined instr_array.(i) in
-          let new_out = 
-            if i < n - 1 then
-              live_in.(i + 1)
-            else
-              RegSet.empty
-          in
-          let new_in = RegSet.union used (RegSet.diff new_out defined) in
-          if not (RegSet.equal live_in.(i) new_in) || 
-             not (RegSet.equal live_out.(i) new_out) then
-            (
-              live_in.(i) <- new_in;
-              live_out.(i) <- new_out;
-              changed := true
-            )
-        done
-      done;
-      { live_in; live_out }
-  
-  let get_live_regs info instr_index =
-    if instr_index >= 0 && instr_index < Array.length info.live_in then
-      info.live_in.(instr_index)
-    else
-      RegSet.empty
-      
-  let is_live info instr_index reg =
-    RegSet.mem reg (get_live_regs info instr_index)
-end
-
 module IRToRiscV = struct
-  let reg_map var_offsets frame_size = function
-    | RiscvReg s -> s
-    | Temp n -> 
-        if n < 7 then 
-          Printf.sprintf "t%d" n
-        else if n < 15 then 
-          Printf.sprintf "a%d" (n - 7)
-        else
-          let stack_offset = -(68 + (n - 15 + 1) * 4) in
-          Printf.sprintf "%d(s0)" stack_offset
+  let reg_names = [|
+    "t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6";
+    "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7";
+    "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"
+  |]
   
+  let reg_map reg =
+    match reg with
+    | RiscvReg s -> s
+    | Temp n when n < Array.length reg_names -> reg_names.(n)
+    | Temp n -> 
+        let stack_offset = -(68 + (n - Array.length reg_names) * 4) in
+        Printf.sprintf "%d(s0)" stack_offset
+
   let instr_to_asm var_offsets frame_size instrs =
-    let liveness_info = LivenessAnalysis.analyze_liveness instrs in
-    
     let rec convert_instrs acc_index acc_code instr_list =
       match instr_list with
-      | [] -> acc_code
+      | [] -> List.rev acc_code
       | instr :: rest ->
-          let code = 
+          let handle_reg r =
+            match r with
+            | Temp n when n >= Array.length reg_names -> 
+                let offset = -(68 + (n - Array.length reg_names) * 4) in
+                let temp_reg = "t0" in
+                ([Printf.sprintf "  lw %s, %d(s0)" temp_reg offset], temp_reg)
+            | _ -> ([], reg_map r)
+          in
+          
+          let handle_store_reg r value_reg =
+            match r with
+            | Temp n when n >= Array.length reg_names -> 
+                let offset = -(68 + (n - Array.length reg_names) * 4) in
+                [Printf.sprintf "  sw %s, %d(s0)" value_reg offset]
+            | _ -> []
+          in
+          
+          let (pre_code, post_code, asm_code) = 
             match instr with
             | Li (r, n) -> 
-                let rd = reg_map var_offsets frame_size r in
+                let (pre, rd) = handle_reg r in
                 if n >= -2048 && n <= 2047 then
-                  Printf.sprintf "  addi %s, x0, %d" rd n
+                  (pre, [], Printf.sprintf "  addi %s, x0, %d" rd n)
                 else
                   let signed_lower = n land 0xFFF in
                   let upper_20 = (n asr 12) land 0xFFFFF in
                   let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
                   let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
-                  Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" rd adjusted_upper rd rd signed_lower
+                  (pre, [], Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" 
+                     rd adjusted_upper rd rd signed_lower)
+                     
             | Mv (rd, rs) ->
-                let rd_reg = reg_map var_offsets frame_size rd in
-                let rs_reg = reg_map var_offsets frame_size rs in
-                Printf.sprintf "  add %s, %s, x0" rd_reg rs_reg
+                let (pre_rs, rs_reg) = handle_reg rs in
+                let (pre_rd, rd_reg) = handle_reg rd in
+                let post = handle_store_reg rd rs_reg in
+                (pre_rs @ pre_rd, post, Printf.sprintf "  add %s, %s, x0" rd_reg rs_reg)
+                
             | BinaryOp (op, rd, rs1, rs2) ->
-                let rd_reg = reg_map var_offsets frame_size rd in
-                let rs1_reg = reg_map var_offsets frame_size rs1 in
-                let rs2_reg = reg_map var_offsets frame_size rs2 in
-                Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg
+                let (pre1, rs1_reg) = handle_reg rs1 in
+                let (pre2, rs2_reg) = handle_reg rs2 in
+                let (pre3, rd_reg) = handle_reg rd in
+                let post = handle_store_reg rd rd_reg in
+                (pre1 @ pre2 @ pre3, post, Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg)
+                
             | BinaryOpImm (op, rd, rs, imm) ->
-                let rd_reg = reg_map var_offsets frame_size rd in
-                let rs_reg = reg_map var_offsets frame_size rs in
-                if imm >= -2048 && imm <= 2047 then
-                  Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm
-                else
-                  let temp_reg = "t0" in
-                  let load_imm = 
-                    let signed_lower = imm land 0xFFF in
-                    let upper_20 = (imm asr 12) land 0xFFFFF in
-                    let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
-                    let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
-                    Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" temp_reg adjusted_upper temp_reg temp_reg signed_lower
-                  in
-                  Printf.sprintf "%s\n  %s %s, %s, %s" load_imm op rd_reg rs_reg temp_reg
+                let (pre_rs, rs_reg) = handle_reg rs in
+                let (pre_rd, rd_reg) = handle_reg rd in
+                let post = handle_store_reg rd rd_reg in
+                (match op with
+                 | "addi" | "slti" | "xori" ->  (* 这些指令需要立即数 *)
+                     if imm >= -2048 && imm <= 2047 then
+                       (pre_rs @ pre_rd, post, Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm)
+                     else
+                       let temp_reg = "t0" in
+                       let signed_lower = imm land 0xFFF in
+                       let upper_20 = (imm asr 12) land 0xFFFFF in
+                       let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
+                       let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
+                       let load_imm = 
+                         Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" 
+                           temp_reg adjusted_upper temp_reg temp_reg signed_lower
+                       in
+                       (pre_rs @ pre_rd @ [load_imm], post, 
+                        Printf.sprintf "  %s %s, %s, %s" op rd_reg rs_reg temp_reg)
+                 | _ -> 
+                     (pre_rs @ pre_rd, post, Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm))
+                     
             | Branch (cond, rs1, rs2, label) ->
-                let rs1_reg = reg_map var_offsets frame_size rs1 in
-                let rs2_reg = reg_map var_offsets frame_size rs2 in
+                let (pre1, rs1_reg) = handle_reg rs1 in
+                let (pre2, rs2_reg) = handle_reg rs2 in
                 (match cond with
-                 | "beqz" -> Printf.sprintf "  beq %s, x0, %s" rs1_reg label
-                 | "bnez" -> Printf.sprintf "  bne %s, x0, %s" rs1_reg label
-                 | _ -> Printf.sprintf "  %s %s, %s, %s" cond rs1_reg rs2_reg label)
+                 | "beqz" -> (pre1 @ pre2, [], Printf.sprintf "  beq %s, x0, %s" rs1_reg label)
+                 | "bnez" -> (pre1 @ pre2, [], Printf.sprintf "  bne %s, x0, %s" rs1_reg label)
+                 | _ -> (pre1 @ pre2, [], Printf.sprintf "  %s %s, %s, %s" cond rs1_reg rs2_reg label))
+                 
             | Jmp label -> 
-                Printf.sprintf "  j %s" label
+                ([], [], Printf.sprintf "  j %s" label)
+                
             | Label label -> 
-                Printf.sprintf "%s:" label
+                ([], [], Printf.sprintf "%s:" label)
+                
             | Call func -> 
-                Printf.sprintf "  jal ra, %s" func
+                ([], [], Printf.sprintf "  jal ra, %s" func)
+                
             | Ret -> 
-                "  jalr x0, ra, 0"
+                ([], [], "  jalr x0, ra, 0")
+                
             | Store (rs, base, offset) ->
-                let rs_reg = reg_map var_offsets frame_size rs in
-                let base_reg = reg_map var_offsets frame_size base in
-                Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg
+                let (pre_rs, rs_reg) = handle_reg rs in
+                let (pre_base, base_reg) = handle_reg base in
+                (pre_rs @ pre_base, [], Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg)
+                
             | Load (rd, base, offset) ->
-                let rd_reg = reg_map var_offsets frame_size rd in
-                let base_reg = reg_map var_offsets frame_size base in
-                Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg
+                let (pre_base, base_reg) = handle_reg base in
+                let (pre_rd, rd_reg) = handle_reg rd in
+                let post = handle_store_reg rd rd_reg in
+                (pre_base @ pre_rd, post, Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg)
+                
             | ReloadVar (rd, var_name) ->
-                (try
+                try
                   let offset = Hashtbl.find var_offsets var_name in
-                  let rd_reg = reg_map var_offsets frame_size rd in
-                  Printf.sprintf "  lw %s, %d(s0)" rd_reg offset
+                  let (pre_rd, rd_reg) = handle_reg rd in
+                  let post = handle_store_reg rd rd_reg in
+                  (pre_rd, post, Printf.sprintf "  lw %s, %d(s0)" rd_reg offset)
                 with Not_found ->
-                  failwith ("Variable " ^ var_name ^ " not found during code generation"))
+                  failwith ("Variable " ^ var_name ^ " not found during code generation")
           in
-          convert_instrs (acc_index + 1) (acc_code ^ code ^ "\n") rest
+          
+          let full_code = 
+            (List.map (fun s -> s ^ "\n") pre_code) @ 
+            [asm_code] @ 
+            (List.map (fun s -> s ^ "\n") post_code)
+          in
+          convert_instrs (acc_index + 1) (full_code @ acc_code) rest
     in
-    convert_instrs 0 "" instrs
+    convert_instrs 0 [] instrs
 
   let calculate_frame_size (ir_func : ir_func) =
     let base_size = 16 in
@@ -759,7 +715,7 @@ module IRToRiscV = struct
             | Store (_, RiscvReg "sp", offset) when offset > 0 -> offset + 4
             | Load (Temp n, _, _) | Li (Temp n, _) | Mv (Temp n, _) 
             | BinaryOp (_, Temp n, _, _) | BinaryOpImm (_, Temp n, _, _) ->
-                if n >= 15 then (n - 14) * 4 else 0
+                if n >= Array.length reg_names then (n - Array.length reg_names + 1) * 4 else 0
             | _ -> 0
           in
           max extra (analyze_instrs rest)
@@ -768,18 +724,36 @@ module IRToRiscV = struct
     let aligned = ((base_size + call_stack + 15) / 16) * 16 in
     max aligned 32
 
+  let save_callee_saved frame_size =
+    let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
+    List.mapi (fun i reg ->
+      Printf.sprintf "  sw %s, %d(sp)\n" reg (frame_size - 12 - i * 4)
+    ) s_regs
+    |> String.concat ""
+
+  let restore_callee_saved frame_size =
+    let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
+    List.mapi (fun i reg ->
+      Printf.sprintf "  lw %s, %d(sp)\n" reg (frame_size - 12 - i * 4)
+    ) s_regs
+    |> String.concat ""
+
   let function_prologue name frame_size =
     let ra_offset = frame_size - 4 in
     let s0_offset = frame_size - 8 in
+    let save_code = save_callee_saved frame_size in
     Printf.sprintf "%s:\n" name ^
     Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
     Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
     Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
+    save_code ^
     Printf.sprintf "  addi s0, sp, %d\n" frame_size
 
   let function_epilogue frame_size =
     let ra_offset = frame_size - 4 in 
     let s0_offset = frame_size - 8 in 
+    let restore_code = restore_callee_saved frame_size in
+    restore_code ^
     Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
     Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
     Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
@@ -800,7 +774,7 @@ module IRToRiscV = struct
     ) ir_func.params;
     
     let asm_code = instr_to_asm var_offsets frame_size ir_func.body in
-    Buffer.add_string buf asm_code;
+    List.iter (fun line -> Buffer.add_string buf line) asm_code;
     
     let has_explicit_ret = List.exists (function Ret -> true | _ -> false) ir_func.body in
     if not has_explicit_ret then
