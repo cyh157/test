@@ -742,20 +742,15 @@ module IRToRiscV = struct
 
   (* 加载立即数的辅助函数 - 处理大立即数 *)
   let load_immediate reg_str imm =
-  if imm >= -2048 && imm <= 2047 then
-    Printf.sprintf "  addi %s, zero, %d" reg_str imm
-  else
-    let upper = imm asr 12 in
-    let lower = imm land 0xFFF in
-    (* 如果低12位是负数，需要调整 *)
-    let (upper, lower) = 
-      if lower >= 2048 then (upper + 1, lower - 4096)
-      else (upper, lower)
-    in
-    if upper <> 0 then
-      Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" reg_str upper reg_str reg_str lower
+    if imm >= -2048 && imm <= 2047 then
+      Printf.sprintf "  addi %s, zero, %d" reg_str imm
     else
-      Printf.sprintf "  addi %s, zero, %d" reg_str lower
+      let upper = (imm + 0x800) asr 12 in  (* 调整高20位 *)
+      let lower = imm land 0xFFF in
+      if upper land 0xFFFFF <> 0 then
+        Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" reg_str upper reg_str reg_str lower
+      else
+        Printf.sprintf "  addi %s, zero, %d" reg_str lower
 
   (* 修改instr_to_asm函数以处理栈访问 *)
   (* 修改 IRToRiscV 模块中的 instr_to_asm 函数 *)
