@@ -1,3 +1,4 @@
+
 exception LexicalError of string [@@warning "-38"]
 exception SemanticError of string
 
@@ -583,6 +584,25 @@ module IRToRiscV = struct
         let stack_offset = -(68 + (n - Array.length reg_names) * 4) in
         Printf.sprintf "%d(s0)" stack_offset
 
+  let calculate_frame_size (ir_func : ir_func) =
+    let base_size = 16 in
+    let rec analyze_instrs = function
+      | [] -> 0
+      | instr :: rest ->
+          let extra = 
+            match instr with
+            | Store (_, RiscvReg "sp", offset) when offset > 0 -> offset + 4
+            | Load (Temp n, _, _) | Li (Temp n, _) | Mv (Temp n, _) 
+            | BinaryOp (_, Temp n, _, _) | BinaryOpImm (_, Temp n, _, _) ->
+                if n >= Array.length reg_names then (n - Array.length reg_names + 1) * 4 else 0
+            | _ -> 0
+          in
+          max extra (analyze_instrs rest)
+    in
+    let call_stack = analyze_instrs ir_func.body in
+    let aligned = ((base_size + call_stack + 15) / 16) * 16 in
+    max aligned 32
+
   let instr_to_asm var_offsets frame_size instrs =
     let rec convert_instrs acc_index acc_code instr_list =
       match instr_list with
@@ -605,32 +625,34 @@ module IRToRiscV = struct
             | _ -> []
           in
           
-          let (pre_code, post_code, asm_code) = 
+          let (pre_code, post_code, asm_lines) = 
             match instr with
             | Li (r, n) -> 
                 let (pre, rd) = handle_reg r in
                 if n >= -2048 && n <= 2047 then
-                  (pre, [], Printf.sprintf "  addi %s, x0, %d" rd n)
+                  (pre, [], [Printf.sprintf "  addi %s, x0, %d" rd n])
                 else
                   let signed_lower = n land 0xFFF in
                   let upper_20 = (n asr 12) land 0xFFFFF in
                   let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
                   let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
-                  (pre, [], Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" 
-                     rd adjusted_upper rd rd signed_lower)
+                  (pre, [], [
+                    Printf.sprintf "  lui %s, %d" rd adjusted_upper;
+                    Printf.sprintf "  addi %s, %s, %d" rd rd signed_lower
+                  ])
                      
             | Mv (rd, rs) ->
                 let (pre_rs, rs_reg) = handle_reg rs in
                 let (pre_rd, rd_reg) = handle_reg rd in
                 let post = handle_store_reg rd rs_reg in
-                (pre_rs @ pre_rd, post, Printf.sprintf "  add %s, %s, x0" rd_reg rs_reg)
+                (pre_rs @ pre_rd, post, [Printf.sprintf "  add %s, %s, x0" rd_reg rs_reg])
                 
             | BinaryOp (op, rd, rs1, rs2) ->
                 let (pre1, rs1_reg) = handle_reg rs1 in
                 let (pre2, rs2_reg) = handle_reg rs2 in
                 let (pre3, rd_reg) = handle_reg rd in
                 let post = handle_store_reg rd rd_reg in
-                (pre1 @ pre2 @ pre3, post, Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg)
+                (pre1 @ pre2 @ pre3, post, [Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg])
                 
             | BinaryOpImm (op, rd, rs, imm) ->
                 let (pre_rs, rs_reg) = handle_reg rs in
@@ -639,90 +661,70 @@ module IRToRiscV = struct
                 (match op with
                  | "addi" | "slti" | "xori" ->  (* 这些指令需要立即数 *)
                      if imm >= -2048 && imm <= 2047 then
-                       (pre_rs @ pre_rd, post, Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm)
+                       (pre_rs @ pre_rd, post, [Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm])
                      else
                        let temp_reg = "t0" in
                        let signed_lower = imm land 0xFFF in
                        let upper_20 = (imm asr 12) land 0xFFFFF in
                        let signed_lower = if signed_lower >= 2048 then signed_lower - 4096 else signed_lower in
                        let adjusted_upper = if signed_lower < 0 then upper_20 + 1 else upper_20 in
-                       let load_imm = 
-                         Printf.sprintf "  lui %s, %d\n  addi %s, %s, %d" 
-                           temp_reg adjusted_upper temp_reg temp_reg signed_lower
-                       in
-                       (pre_rs @ pre_rd @ [load_imm], post, 
-                        Printf.sprintf "  %s %s, %s, %s" op rd_reg rs_reg temp_reg)
+                       (pre_rs @ pre_rd, post, [
+                         Printf.sprintf "  lui %s, %d" temp_reg adjusted_upper;
+                         Printf.sprintf "  addi %s, %s, %d" temp_reg temp_reg signed_lower;
+                         Printf.sprintf "  %s %s, %s, %s" op rd_reg rs_reg temp_reg
+                       ])
                  | _ -> 
-                     (pre_rs @ pre_rd, post, Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm))
+                     (pre_rs @ pre_rd, post, [Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm]))
                      
             | Branch (cond, rs1, rs2, label) ->
                 let (pre1, rs1_reg) = handle_reg rs1 in
                 let (pre2, rs2_reg) = handle_reg rs2 in
                 (match cond with
-                 | "beqz" -> (pre1 @ pre2, [], Printf.sprintf "  beq %s, x0, %s" rs1_reg label)
-                 | "bnez" -> (pre1 @ pre2, [], Printf.sprintf "  bne %s, x0, %s" rs1_reg label)
-                 | _ -> (pre1 @ pre2, [], Printf.sprintf "  %s %s, %s, %s" cond rs1_reg rs2_reg label))
+                 | "beqz" -> (pre1 @ pre2, [], [Printf.sprintf "  beq %s, x0, %s" rs1_reg label])
+                 | "bnez" -> (pre1 @ pre2, [], [Printf.sprintf "  bne %s, x0, %s" rs1_reg label])
+                 | _ -> (pre1 @ pre2, [], [Printf.sprintf "  %s %s, %s, %s" cond rs1_reg rs2_reg label]))
                  
             | Jmp label -> 
-                ([], [], Printf.sprintf "  j %s" label)
+                ([], [], [Printf.sprintf "  j %s" label])
                 
             | Label label -> 
-                ([], [], Printf.sprintf "%s:" label)
+                ([], [], [Printf.sprintf "%s:" label])
                 
             | Call func -> 
-                ([], [], Printf.sprintf "  jal ra, %s" func)
+                ([], [], [Printf.sprintf "  jal ra, %s" func])
                 
             | Ret -> 
-                ([], [], "  jalr x0, ra, 0")
+                ([], [], ["  jalr x0, ra, 0"])
                 
             | Store (rs, base, offset) ->
                 let (pre_rs, rs_reg) = handle_reg rs in
                 let (pre_base, base_reg) = handle_reg base in
-                (pre_rs @ pre_base, [], Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg)
+                (pre_rs @ pre_base, [], [Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg])
                 
             | Load (rd, base, offset) ->
                 let (pre_base, base_reg) = handle_reg base in
                 let (pre_rd, rd_reg) = handle_reg rd in
                 let post = handle_store_reg rd rd_reg in
-                (pre_base @ pre_rd, post, Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg)
+                (pre_base @ pre_rd, post, [Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg])
                 
             | ReloadVar (rd, var_name) ->
                 try
                   let offset = Hashtbl.find var_offsets var_name in
                   let (pre_rd, rd_reg) = handle_reg rd in
                   let post = handle_store_reg rd rd_reg in
-                  (pre_rd, post, Printf.sprintf "  lw %s, %d(s0)" rd_reg offset)
+                  (pre_rd, post, [Printf.sprintf "  lw %s, %d(s0)" rd_reg offset])
                 with Not_found ->
                   failwith ("Variable " ^ var_name ^ " not found during code generation")
           in
           
           let full_code = 
-            (List.map (fun s -> s ^ "\n") pre_code) @ 
-            [asm_code] @ 
-            (List.map (fun s -> s ^ "\n") post_code)
+            (List.map (fun s -> s) pre_code) @ 
+            asm_lines @ 
+            (List.map (fun s -> s) post_code)
           in
-          convert_instrs (acc_index + 1) (full_code @ acc_code) rest
+          convert_instrs (acc_index + 1) ((List.rev full_code) @ acc_code) rest
     in
     convert_instrs 0 [] instrs
-
-  let calculate_frame_size (ir_func : ir_func) =
-    let base_size = 16 in
-    let rec analyze_instrs = function
-      | [] -> 0
-      | instr :: rest ->
-          let extra = 
-            match instr with
-            | Store (_, RiscvReg "sp", offset) when offset > 0 -> offset + 4
-            | Load (Temp n, _, _) | Li (Temp n, _) | Mv (Temp n, _) 
-            | BinaryOp (_, Temp n, _, _) | BinaryOpImm (_, Temp n, _, _) ->
-                if n >= Array.length reg_names then (n - Array.length reg_names + 1) * 4 else 0
-            | _ -> 0
-          in
-          max extra (analyze_instrs rest)
-    in
-    let call_stack = analyze_instrs ir_func.body in
-    let aligned = ((base_size + call_stack + 15) / 16) * 16 in
-    max aligned 32
 
   let save_callee_saved frame_size =
     let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
@@ -770,11 +772,12 @@ module IRToRiscV = struct
         Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
       else
         let param_stack_offset = (i - 8) * 4 in
-        Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)\n" param_stack_offset offset)
+        Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n" param_stack_offset);
+        Buffer.add_string buf (Printf.sprintf "  sw t0, %d(s0)\n" offset)
     ) ir_func.params;
     
-    let asm_code = instr_to_asm var_offsets frame_size ir_func.body in
-    List.iter (fun line -> Buffer.add_string buf line) asm_code;
+    let asm_lines = instr_to_asm var_offsets frame_size ir_func.body in
+    List.iter (fun line -> Buffer.add_string buf line; Buffer.add_char buf '\n') asm_lines;
     
     let has_explicit_ret = List.exists (function Ret -> true | _ -> false) ir_func.body in
     if not has_explicit_ret then
@@ -795,6 +798,9 @@ let () =
   List.iter (fun vo -> Hashtbl.iter (fun k v -> Hashtbl.add combined_var_offsets k v) vo) var_offsets_list;
   
   Printf.printf ".global main\n";
-  List.iter (fun func -> Printf.printf "%s\n" (IRToRiscV.func_to_asm combined_var_offsets func)) ir_funcs;
+  List.iter (fun func -> 
+    let asm = IRToRiscV.func_to_asm combined_var_offsets func in
+    Printf.printf "%s\n" asm
+  ) ir_funcs;
   
   prerr_endline "Compilation successful! Output is standard RISC-V 32-bit assembly (no pseudoinstructions).";
