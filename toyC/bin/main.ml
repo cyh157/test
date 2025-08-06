@@ -775,31 +775,39 @@ module IRToRiscV = struct
     in
     convert_instrs 0 [] instrs
 
+  (* 生成保存被调用者保存寄存器的指令列表（每条指令单独一项） *)
   let save_callee_saved frame_size =
     let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
-    List.mapi (fun i reg ->
+    List.flatten (List.mapi (fun i reg ->
       let offset = frame_size - 12 - i * 4 in
       if offset >= -2048 && offset <= 2047 then
-        Printf.sprintf "  sw %s, %d(sp)" reg offset
+        [Printf.sprintf "  sw %s, %d(sp)" reg offset]
       else
         let (upper, lower) = split_large_immediate offset in
-        Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  sw %s, 0(t0)" 
-          upper lower reg
-    ) s_regs
-    |> String.concat "\n"
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add t0, t0, sp";
+          Printf.sprintf "  sw %s, 0(t0)" reg
+        ]
+    ) s_regs)
 
+  (* 生成恢复被调用者保存寄存器的指令列表（每条指令单独一项） *)
   let restore_callee_saved frame_size =
     let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
-    List.mapi (fun i reg ->
+    List.flatten (List.mapi (fun i reg ->
       let offset = frame_size - 12 - i * 4 in
       if offset >= -2048 && offset <= 2047 then
-        Printf.sprintf "  lw %s, %d(sp)" reg offset
+        [Printf.sprintf "  lw %s, %d(sp)" reg offset]
       else
         let (upper, lower) = split_large_immediate offset in
-        Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  lw %s, 0(t0)" 
-          upper lower reg
-    ) s_regs
-    |> String.concat "\n"
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add t0, t0, sp";
+          Printf.sprintf "  lw %s, 0(t0)" reg
+        ]
+    ) s_regs)
 
   let function_prologue name frame_size =
     let ra_offset = frame_size - 4 in
@@ -820,102 +828,152 @@ module IRToRiscV = struct
         ]
     in
     
-    Printf.sprintf "%s:\n" name ^
-    String.concat "\n" sp_adjust ^ "\n" ^
-    (if ra_offset >= -2048 && ra_offset <= 2047 then
-       Printf.sprintf "  sw ra, %d(sp)\n" ra_offset
-     else
-       let (upper, lower) = split_large_immediate ra_offset in
-       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  sw ra, 0(t0)\n" 
-         upper lower) ^
-    (if s0_offset >= -2048 && s0_offset <= 2047 then
-       Printf.sprintf "  sw s0, %d(sp)\n" s0_offset
-     else
-       let (upper, lower) = split_large_immediate s0_offset in
-       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  sw s0, 0(t0)\n" 
-         upper lower) ^
-    save_code ^
-    (if frame_size >= -2048 && frame_size <= 2047 then
-       Printf.sprintf "  addi s0, sp, %d\n" frame_size
-     else
-       let (upper, lower) = split_large_immediate frame_size in
-       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add s0, sp, t0\n" 
-         upper lower)
+    let ra_save =
+      if ra_offset >= -2048 && ra_offset <= 2047 then
+        [Printf.sprintf "  sw ra, %d(sp)" ra_offset]
+      else
+        let (upper, lower) = split_large_immediate ra_offset in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add t0, t0, sp";
+          Printf.sprintf "  sw ra, 0(t0)"
+        ]
+    in
+    
+    let s0_save =
+      if s0_offset >= -2048 && s0_offset <= 2047 then
+        [Printf.sprintf "  sw s0, %d(sp)" s0_offset]
+      else
+        let (upper, lower) = split_large_immediate s0_offset in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add t0, t0, sp";
+          Printf.sprintf "  sw s0, 0(t0)"
+        ]
+    in
+    
+    let s0_init =
+      if frame_size >= -2048 && frame_size <= 2047 then
+        [Printf.sprintf "  addi s0, sp, %d" frame_size]
+      else
+        let (upper, lower) = split_large_immediate frame_size in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add s0, sp, t0"
+        ]
+    in
+    
+    (* 组合所有指令，确保每条指令单独一项 *)
+    (Printf.sprintf "%s:" name) :: 
+    (sp_adjust @ ra_save @ s0_save @ save_code @ s0_init)
 
   let function_epilogue frame_size =
     let ra_offset = frame_size - 4 in 
     let s0_offset = frame_size - 8 in 
     let restore_code = restore_callee_saved frame_size in
     
-    restore_code ^
-    (if ra_offset >= -2048 && ra_offset <= 2047 then
-       Printf.sprintf "  lw ra, %d(sp)\n" ra_offset
-     else
-       let (upper, lower) = split_large_immediate ra_offset in
-       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  lw ra, 0(t0)\n" 
-         upper lower) ^
-    (if s0_offset >= -2048 && s0_offset <= 2047 then
-       Printf.sprintf "  lw s0, %d(sp)\n" s0_offset
-     else
-       let (upper, lower) = split_large_immediate s0_offset in
-       Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, sp\n  lw s0, 0(t0)\n" 
-         upper lower) ^
-    (if frame_size <= 2047 then
-       Printf.sprintf "  addi sp, sp, %d\n" frame_size
-     else
-       let (upper, lower) = split_large_immediate frame_size in
-       [
-         Printf.sprintf "  lui t0, %d" upper;
-         Printf.sprintf "  addi t0, t0, %d" lower;
-         "  add sp, sp, t0"
-       ] |> String.concat "\n") ^
-    "  jalr x0, ra, 0\n"
+    let ra_restore =
+      if ra_offset >= -2048 && ra_offset <= 2047 then
+        [Printf.sprintf "  lw ra, %d(sp)" ra_offset]
+      else
+        let (upper, lower) = split_large_immediate ra_offset in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add t0, t0, sp";
+          Printf.sprintf "  lw ra, 0(t0)"
+        ]
+    in
+    
+    let s0_restore =
+      if s0_offset >= -2048 && s0_offset <= 2047 then
+        [Printf.sprintf "  lw s0, %d(sp)" s0_offset]
+      else
+        let (upper, lower) = split_large_immediate s0_offset in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          Printf.sprintf "  add t0, t0, sp";
+          Printf.sprintf "  lw s0, 0(t0)"
+        ]
+    in
+    
+    let sp_restore =
+      if frame_size <= 2047 then
+        [Printf.sprintf "  addi sp, sp, %d" frame_size]
+      else
+        let (upper, lower) = split_large_immediate frame_size in
+        [
+          Printf.sprintf "  lui t0, %d" upper;
+          Printf.sprintf "  addi t0, t0, %d" lower;
+          "  add sp, sp, t0"
+        ]
+    in
+    
+    (* 组合所有指令，确保每条指令单独一项 *)
+    restore_code @ ra_restore @ s0_restore @ sp_restore @ ["  jalr x0, ra, 0"]
 
   let func_to_asm var_offsets (ir_func : ir_func) =
     let frame_size = calculate_frame_size ir_func in
-    let buf = Buffer.create 256 in
-    Buffer.add_string buf (function_prologue ir_func.name frame_size);
+    let prologue = function_prologue ir_func.name frame_size in
     
-    List.iteri (fun i param ->
+    (* 处理参数的指令列表 *)
+    let param_code = List.flatten (List.mapi (fun i param ->
       let offset = -(68 + i * 4) in
       if i < 8 then (
         if offset >= -2048 && offset <= 2047 then
-          Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
+          [Printf.sprintf "  sw a%d, %d(s0)" i offset]
         else
           let (upper, lower) = split_large_immediate offset in
-          Buffer.add_string buf (
-            Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, s0\n  sw a%d, 0(t0)\n" 
-              upper lower i
-          )
+          [
+            Printf.sprintf "  lui t0, %d" upper;
+            Printf.sprintf "  addi t0, t0, %d" lower;
+            Printf.sprintf "  add t0, t0, s0";
+            Printf.sprintf "  sw a%d, 0(t0)" i
+          ]
       ) else
         let param_stack_offset = (i - 8) * 4 in
-        if param_stack_offset >= -2048 && param_stack_offset <= 2047 then
-          Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n" param_stack_offset)
-        else
-          let (upper, lower) = split_large_immediate param_stack_offset in
-          Buffer.add_string buf (
-            Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n  add t0, t0, s0\n  lw t0, 0(t0)\n" 
-              upper lower
-          );
-          
-        if offset >= -2048 && offset <= 2047 then
-          Buffer.add_string buf (Printf.sprintf "  sw t0, %d(s0)\n" offset)
-        else
-          let (upper, lower) = split_large_immediate offset in
-          Buffer.add_string buf (
-            Printf.sprintf "  lui t1, %d\n  addi t1, t1, %d\n  add t1, t1, s0\n  sw t0, 0(t1)\n" 
-              upper lower
-          )
-    ) ir_func.params;
+        let load_param =
+          if param_stack_offset >= -2048 && param_stack_offset <= 2047 then
+            [Printf.sprintf "  lw t0, %d(s0)" param_stack_offset]
+          else
+            let (upper, lower) = split_large_immediate param_stack_offset in
+            [
+              Printf.sprintf "  lui t0, %d" upper;
+              Printf.sprintf "  addi t0, t0, %d" lower;
+              Printf.sprintf "  add t0, t0, s0";
+              Printf.sprintf "  lw t0, 0(t0)"
+            ]
+        in
+        let store_param =
+          if offset >= -2048 && offset <= 2047 then
+            [Printf.sprintf "  sw t0, %d(s0)" offset]
+          else
+            let (upper, lower) = split_large_immediate offset in
+            [
+              Printf.sprintf "  lui t1, %d" upper;
+              Printf.sprintf "  addi t1, t1, %d" lower;
+              Printf.sprintf "  add t1, t1, s0";
+              Printf.sprintf "  sw t0, 0(t1)"
+            ]
+        in
+        load_param @ store_param
+    ) ir_func.params) in
     
-    let asm_lines = instr_to_asm var_offsets frame_size ir_func.body in
-    List.iter (fun line -> Buffer.add_string buf line; Buffer.add_char buf '\n') asm_lines;
+    let body_code = instr_to_asm var_offsets frame_size ir_func.body in
     
-    let has_explicit_ret = List.exists (function Ret -> true | _ -> false) ir_func.body in
-    if not has_explicit_ret then
-      Buffer.add_string buf (function_epilogue frame_size);
+    let epilogue = 
+      if not (List.exists (function Ret -> true | _ -> false) ir_func.body) then
+        function_epilogue frame_size
+      else
+        []
+    in
     
-    Buffer.contents buf
+    (* 组合所有指令并转换为字符串，每条指令占一行 *)
+    String.concat "\n" (prologue @ param_code @ body_code @ epilogue)
 end
 
 (* ==================== 主程序：生成标准RISC-V汇编 ==================== *)
