@@ -14,8 +14,8 @@ type reg =
 type ir_instr =
   | Li of reg * int                (* 加载立即数 *)
   | Mv of reg * reg                (* 寄存器间移动 *)
-  | BinaryOp of string * reg * reg * reg (* 二元运算：操作符, 目标寄存器, 源寄存器1, 源寄存器2 *)
-  | BinaryOpImm of string * reg * reg * int (* 带立即数的二元运算：操作符, 目标寄存器, 源寄存器, 立即数 *)
+  | BinaryOp of string * reg * reg * reg (* 二元运算 *)
+  | BinaryOpImm of string * reg * reg * int (* 带立即数的二元运算 *)
   | Branch of string * reg * reg * string (* 条件分支 *)
   | Jmp of string                  (* 无条件跳转 *)
   | Label of string                (* 标签 *)
@@ -24,7 +24,6 @@ type ir_instr =
   | Store of reg * reg * int       (* 存储到内存 *)
   | Load of reg * reg * int        (* 从内存加载 *)
   | ReloadVar of reg * string      (* 在函数调用后重新加载变量 *)
-
 type ir_func = {
   name: string;
   params: string list;
@@ -56,17 +55,17 @@ let initial_state = {
 
 (* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
-  if state.temp_counter < 26 then  (* 限制在26个寄存器内 *)
-    let temp = state.temp_counter in
-    (Temp temp, {state with temp_counter = temp + 1})
-  else
-    let stack_var = state.stack_size in
-    (Temp (26 + stack_var), {state with stack_size = state.stack_size + 1})
+  match state.free_temps with
+  | temp :: rest -> 
+      (Temp temp, {state with free_temps = rest})
+  | [] -> 
+      let temp = state.temp_counter in
+      (Temp temp, {state with temp_counter = temp + 1})
 
 let free_temp state temp_reg = 
   match temp_reg with
-  | Temp n when n < 26 -> {state with free_temps = n :: state.free_temps}
-  | _ -> state
+  | Temp n -> {state with free_temps = n :: state.free_temps}
+  | RiscvReg _ -> state
 
 let fresh_label state prefix =
   let label = Printf.sprintf "%s_%s%d" state.current_function prefix state.label_counter in
@@ -83,29 +82,25 @@ let get_var_offset_for_use state var =
            lookup remaining_scopes)
   in
   match lookup state.scope_stack with
-  | Some offset -> 
-      (offset, state)
-  | None ->
-      failwith ("Variable " ^ var ^ " not found in local scopes")
+  | Some offset -> (offset, state)
+  | None -> failwith ("Variable " ^ var ^ " not found in local scopes")
 
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      (* 从栈帧基地址向下分配（s0是栈帧基地址） *)
-      let offset = -4 * (1 + state.stack_size) in  (* 修正：使用动态计算而非固定偏移 *)
+      let offset = -(500 + state.stack_size) in
       Hashtbl.add current_scope var offset;
-      let new_state = {state with stack_size = state.stack_size + 1} in
+      let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
   | [] ->
       let new_scope = Hashtbl.create 10 in
-      let offset = -4 * (1 + state.stack_size) in  (* 修正：使用动态计算而非固定偏移 *)
+      let offset = -(500 + state.stack_size) in
       Hashtbl.add new_scope var offset;
       let new_state = {state with 
                        scope_stack = new_scope :: state.scope_stack;
-                       stack_size = state.stack_size + 1} in
+                       stack_size = state.stack_size + 4} in
       (offset, new_state)
 
-(* 将表达式转换为字符串 *)
 let rec string_of_expr = function
   | Num n -> string_of_int n
   | Var s -> s
@@ -113,7 +108,6 @@ let rec string_of_expr = function
   | Unary (op, e) -> (match op with Plus -> "+" | Minus -> "-" | Not -> "!") ^ string_of_expr e
   | Binary (op, e1, e2) -> (match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Lt -> "<" | Gt -> ">" | Leq -> "<=" | Geq -> ">=" | Eq -> "==" | Neq -> "!=" | And -> "&&" | Or -> "||") ^ "(" ^ string_of_expr e1 ^ ", " ^ string_of_expr e2 ^ ")"
 
-(* 将语句转换为字符串 *)
 let rec string_of_stmt = function
   | BlockStmt b -> "Block(" ^ String.concat "; " (List.map string_of_stmt b.stmts) ^ ")"
   | EmptyStmt -> ";"
@@ -129,30 +123,26 @@ let rec string_of_stmt = function
   | ReturnStmt (Some e) -> "return " ^ string_of_expr e ^ ";"
   | ReturnStmt None -> "return;"
 
-(* 将函数定义转换为字符串 *)
 let string_of_func_def fd =
   (match fd.ret_type with Int -> "int" | Void -> "void") ^ " " ^ fd.name ^ "(" ^ String.concat ", " (List.map (fun p -> (match p.typ with Int -> "int" | Void -> "void") ^ " " ^ p.name) fd.params) ^ ")" ^ " {\n" ^ string_of_stmt (BlockStmt fd.body) ^ "\n}"
 
-(* 将 AST 转换为字符串 *)
 let string_of_ast ast =
   String.concat "\n" (List.map string_of_func_def ast)
 
-(* 辅助函数：检查函数是否在全局作用域 *)
 let is_global_scope = function
   | BlockStmt _ -> false
   | _ -> true
 
-(* 辅助函数：检查 return 语句覆盖所有路径 *)
 let rec check_return_coverage stmt =
   match stmt with
-  | BlockStmt b ->  
+  | BlockStmt b -> 
   let rec check_block stmts =
     match stmts with
     | [] -> false
     | s::rest ->
         if check_return_coverage s 
-        then true  
-        else check_block rest  
+        then true 
+        else check_block rest
   in
   check_block b.stmts
   | IfStmt (cond, then_stmt, Some else_stmt) ->
@@ -162,25 +152,24 @@ let rec check_return_coverage stmt =
   | ReturnStmt _ -> true
   | _ -> false
 
-type func_signature = { ret_type: typ; params: param list } 
-let func_table = Hashtbl.create 30
+  type func_signature = { ret_type: typ; params: param list } 
+  let func_table = Hashtbl.create 30
   
-let collect_functions ast =
-  List.iter (fun (fd : Ast.func_def) ->
-    Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
-  ) ast
+  let collect_functions ast =
+    List.iter (fun (fd : Ast.func_def) ->
+      Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
+    ) ast
 
-let rec check_expr_calls (expr : Ast.expr) =
-  match expr with
-  | Call (name, args) ->
-      if not (Hashtbl.mem func_table name) then
-        raise (SemanticError ("function " ^ name ^ " called but not defined"));
-      List.iter check_expr_calls args
-  | Unary (_, e) -> check_expr_calls e
-  | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
-  | _ -> ()
+  let rec check_expr_calls (expr : Ast.expr) =
+    match expr with
+    | Call (name, args) ->
+        if not (Hashtbl.mem func_table name) then
+          raise (SemanticError ("function " ^ name ^ " called but not defined"));
+        List.iter check_expr_calls args
+    | Unary (_, e) -> check_expr_calls e
+    | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
+    | _ -> ()
 
-(* 语义分析主函数 *)
 let semantic_analysis ast =
   collect_functions ast;
   let has_main = ref false in
@@ -413,7 +402,16 @@ let rec expr_to_ir state expr =
           | _ -> 
               (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
         | Mul -> 
-            (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
+            let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
+            let e2_has_call = List.exists (function Call _ -> true | _ -> false) e2_code in
+            
+            (match (e1, e2) with
+            | (Var x1, _) when e2_has_call -> 
+                (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
+            | (_, Var x2) when e1_has_call -> 
+                (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
+            | _ -> 
+                (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final))
         | Div -> 
             (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state_final)
         | Mod -> 
@@ -513,10 +511,13 @@ let rec stmt_to_ir state stmt =
   | WhileStmt (cond, body) ->
       let (loop_label, state') = fresh_label state "loop" in
       let (end_label, state'') = fresh_label state' "end" in
+      
       let state_with_loop = { state'' with loop_labels = (end_label, loop_label) :: state''.loop_labels } in
+      
       let (cond_reg, cond_code, state''') = expr_to_ir state_with_loop cond in
       let (body_code, state'''') = stmt_to_ir state''' body in
       let state_final = free_temp state'''' cond_reg in
+      
       ( [Label loop_label] @
         cond_code @
         [Branch ("beqz", cond_reg, RiscvReg "zero", end_label)] @
@@ -524,6 +525,7 @@ let rec stmt_to_ir state stmt =
         [Jmp loop_label;
          Label end_label],
         { state_final with loop_labels = List.tl state_final.loop_labels } )
+  
   | BreakStmt ->
       (match state.loop_labels with
        | (end_label, _) :: _ -> ([Jmp end_label], state)
@@ -554,10 +556,10 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   } in
   let param_scope = Hashtbl.create (List.length func.params) in
   let state_with_scope = { state with scope_stack = [param_scope] } in
-  (* 修正：参数偏移量从-4开始，每次递减4，避免固定偏移导致冲突 *)
+  
   let state' = 
     List.fold_left (fun st (i, (param : Ast.param)) ->
-      let offset = -4 * (i + 1) in  (* 从-4开始，依次为-4, -8, -12... *)
+      let offset = -(68 + i * 4) in
       Hashtbl.add param_scope param.name offset;
       Hashtbl.add st.var_offset param.name offset;
       st
@@ -570,435 +572,471 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
     body = body_code;
   }, final_state.var_offset
 
-(* ==================== IR到RISC-V汇编转换（无伪指令） ==================== *)
-module IRToRiscV = struct
-  let reg_names = [|
-    "t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6";
-    "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7";
-    "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"
-  |]
+(* ==================== IR到RISC-V汇编转换 ==================== *)
+module LivenessAnalysis = struct
+  module RegSet = Set.Make(struct
+    type t = reg
+    let compare = compare
+  end)
   
-  let reg_map reg =
-    match reg with
-    | RiscvReg s -> s
-    | Temp n when n < Array.length reg_names -> reg_names.(n)
-    | Temp n -> 
-        let stack_idx = n - Array.length reg_names in
-        let stack_offset = -4 * (stack_idx + 1) in  (* 栈上临时变量偏移 *)
-        Printf.sprintf "%d(s0)" stack_offset
-
-  (* 拆分32位整数为高位（20位）和低位（12位），适应RISC-V立即数范围 *)
-  let split_large_immediate n =
-    let lower = n land 0xFFF in  (* 取低12位 *)
-    let upper = (n lsr 12) land 0xFFFFF in  (* 取高20位 *)
-    (* 处理负数的补码调整（如果低12位最高位为1，高位加1） *)
-    let upper = if lower >= 0x800 then upper + 1 else upper in
-    let adjusted_lower = if lower >= 0x800 then lower - 0x1000 else lower in
-    (upper, adjusted_lower)
-
-  let calculate_frame_size (ir_func : ir_func) =
-    (* 修正：更精确的栈帧大小计算 *)
-    let base_size = 16 in  (* 保存ra, s0和被调用者保存寄存器的基础大小 *)
-    let rec count_stack_temps = function
-      | [] -> 0
-      | instr :: rest ->
-          let count = match instr with
-            | Load (Temp n, _, _) | Li (Temp n, _) | Mv (Temp n, _) 
-            | BinaryOp (_, Temp n, _, _) | BinaryOpImm (_, Temp n, _, _) ->
-                if n >= Array.length reg_names then 1 else 0
-            | _ -> 0
+  let regs_used = function
+    | Li _ -> RegSet.empty
+    | Mv (_, rs) -> RegSet.singleton rs
+    | BinaryOp (_, _, rs1, rs2) -> RegSet.add rs1 (RegSet.singleton rs2)
+    | BinaryOpImm (_, _, rs, _) -> RegSet.singleton rs
+    | Branch (_, rs1, rs2, _) -> RegSet.add rs1 (RegSet.singleton rs2)
+    | Store (rs, _, _) -> RegSet.singleton rs
+    | Load (_, _, _) -> RegSet.empty
+    | ReloadVar (_, _) -> RegSet.empty
+    | Call _ -> 
+        let params = List.init 8 (fun i -> RiscvReg ("a" ^ string_of_int i)) in
+        List.fold_left (fun set reg -> RegSet.add reg set) RegSet.empty params
+    | _ -> RegSet.empty
+  
+  let regs_defined = function
+    | Li (rd, _) -> RegSet.singleton rd
+    | Mv (rd, _) -> RegSet.singleton rd
+    | BinaryOp (rd, _, _, _) -> RegSet.singleton (RiscvReg rd)
+    | BinaryOpImm (rd, _, _, _) -> RegSet.singleton (RiscvReg rd)
+    | Load (rd, _, _) -> RegSet.singleton rd
+    | ReloadVar (rd, _) -> RegSet.singleton rd
+    | Call _ -> RegSet.singleton (RiscvReg "a0")
+    | _ -> RegSet.empty
+  
+  type liveness_info = {
+    live_in: RegSet.t array;
+    live_out: RegSet.t array;
+  }[@@warning "-69"]
+  
+  let analyze_liveness (instrs: ir_instr list) : liveness_info =
+    let n = List.length instrs in
+    if n = 0 then
+      { live_in = [||]; live_out = [||] }
+    else
+      let live_in = Array.make n RegSet.empty in
+      let live_out = Array.make n RegSet.empty in
+      let instr_array = Array.of_list instrs in
+      
+      for i = 0 to n - 1 do
+        live_in.(i) <- RegSet.empty;
+        live_out.(i) <- RegSet.empty;
+      done;
+      
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        
+        for i = n - 1 downto 0 do
+          let used = regs_used instr_array.(i) in
+          let defined = regs_defined instr_array.(i) in
+          
+          let new_out = 
+            if i < n - 1 then live_in.(i + 1) else RegSet.empty
           in
-          count + count_stack_temps rest
-    in
-    let stack_temps = count_stack_temps ir_func.body in
-    let local_vars = List.length ir_func.params + stack_temps in
-    let frame_size = base_size + 4 * local_vars in
-    (* 栈帧大小按16字节对齐 *)
-    let aligned = ((frame_size + 15) / 16) * 16 in
-    max aligned 32  (* 最小栈帧大小32字节 *)
+          
+          let new_in = RegSet.union used (RegSet.diff new_out defined) in
+          
+          if not (RegSet.equal live_in.(i) new_in) || 
+             not (RegSet.equal live_out.(i) new_out) then
+            (
+              live_in.(i) <- new_in;
+              live_out.(i) <- new_out;
+              changed := true
+            )
+        done
+      done;
+      
+      { live_in; live_out }
+  
+  let get_live_regs info instr_index =
+    if instr_index >= 0 && instr_index < Array.length info.live_in then
+      info.live_in.(instr_index)
+    else
+      RegSet.empty
+      
+  let is_live info instr_index reg =
+    RegSet.mem reg (get_live_regs info instr_index)
+end
 
+module IRToRiscV = struct
+  (* 辅助函数：将32位立即数转换为lui+addi组合（无伪指令） *)
+  let generate_load_imm reg value =
+    let imm = value land 0xFFFFFFFF in  (* 确保是32位无符号数 *)
+    let hi = (imm lsr 12) land 0xFFFFF in  (* 高20位 *)
+    let lo = imm land 0xFFF in             (* 低12位 *)
+    
+    (* 处理符号扩展：如果低12位最高位为1，需要调整高位 *)
+    let lo_signed = if (lo land 0x800) != 0 then lo - 0x1000 else lo in
+    let adjusted_hi = if lo_signed < 0 then hi + 1 else hi in
+    
+    (* 生成指令序列 *)
+    if adjusted_hi = 0 then
+      (* 可以仅用addi实现 *)
+      Printf.sprintf "  addi %s, x0, %d" reg lo_signed
+    else
+      let lui = Printf.sprintf "  lui %s, 0x%x" reg adjusted_hi in
+      if lo_signed = 0 then
+        lui
+      else
+        lui ^ "\n  addi " ^ reg ^ ", " ^ reg ^ ", " ^ string_of_int lo_signed
+
+  let reg_map var_offsets frame_size = function
+    | RiscvReg s -> s
+    | Temp n -> 
+        if n < 7 then 
+          Printf.sprintf "t%d" n
+        else if n < 15 then 
+          Printf.sprintf "a%d" (n - 7)
+        else
+          let stack_offset = -(68 + (n - 15 + 1) * 4) in
+          Printf.sprintf "%d(s0)" stack_offset
+  
   let instr_to_asm var_offsets frame_size instrs =
+    let liveness_info = LivenessAnalysis.analyze_liveness instrs in
+    
     let rec convert_instrs acc_index acc_code instr_list =
       match instr_list with
-      | [] -> List.rev acc_code
+      | [] -> acc_code
       | instr :: rest ->
-          let handle_reg r =
-            match r with
-            | Temp n when n >= Array.length reg_names -> 
-                let stack_idx = n - Array.length reg_names in
-                let offset = -4 * (stack_idx + 1) in
-                let temp_reg = "t0" in
-                let code = 
-                  if offset >= -2048 && offset <= 2047 then
-                    [Printf.sprintf "  lw %s, %d(s0)" temp_reg offset]
-                  else
-                    let (upper, lower) = split_large_immediate offset in
-                    [
-                      Printf.sprintf "  lui %s, %d" temp_reg upper;
-                      Printf.sprintf "  addi %s, %s, %d" temp_reg temp_reg lower;
-                      Printf.sprintf "  add %s, %s, s0" temp_reg temp_reg
-                    ]
-                in
-                (code, temp_reg)
-            | _ -> ([], reg_map r)
-          in
-          
-          let handle_store_reg r value_reg =
-            match r with
-            | Temp n when n >= Array.length reg_names -> 
-                let stack_idx = n - Array.length reg_names in
-                let offset = -4 * (stack_idx + 1) in
-                if offset >= -2048 && offset <= 2047 then
-                  [Printf.sprintf "  sw %s, %d(s0)" value_reg offset]
-                else
-                  let (upper, lower) = split_large_immediate offset in
-                  [
-                    Printf.sprintf "  lui t0, %d" upper;
-                    Printf.sprintf "  addi t0, t0, %d" lower;
-                    Printf.sprintf "  add t0, t0, s0";
-                    Printf.sprintf "  sw %s, 0(t0)" value_reg
-                  ]
-            | _ -> []
-          in
-          
-          let (pre_code, post_code, asm_lines) = 
+          let code = 
             match instr with
             | Li (r, n) -> 
-                let (pre, rd) = handle_reg r in
-                if n >= -2048 && n <= 2047 then
-                  (pre, [], [Printf.sprintf "  addi %s, x0, %d" rd n])
-                else
-                  let (upper, lower) = split_large_immediate n in
-                  (pre, [], [
-                    Printf.sprintf "  lui %s, %d" rd upper;
-                    Printf.sprintf "  addi %s, %s, %d" rd rd lower
-                  ])
-                     
+                (match r with
+                | Temp temp_reg when temp_reg >= 15 -> 
+                    let stack_offset = -(68 + (temp_reg - 15 + 1) * 4) in
+                    let load_t0 = generate_load_imm "t0" n in
+                    load_t0 ^ "\n  sw t0, " ^ string_of_int stack_offset ^ "(s0)"
+                | _ -> 
+                    let reg = reg_map var_offsets frame_size r in
+                    generate_load_imm reg n)
             | Mv (rd, rs) ->
-                let (pre_rs, rs_reg) = handle_reg rs in
-                let (pre_rd, rd_reg) = handle_reg rd in
-                let post = handle_store_reg rd rs_reg in
-                (pre_rs @ pre_rd, post, [Printf.sprintf "  add %s, %s, x0" rd_reg rs_reg])
-                
+                (match (rd, rs) with
+                | (Temp n, _) when n >= 15 -> 
+                    let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                    Printf.sprintf "  mv t0, %s\n  sw t0, %d(s0)" 
+                      (reg_map var_offsets frame_size rs) stack_offset
+                | (_, Temp n) when n >= 15 -> 
+                    let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                    Printf.sprintf "  lw t0, %d(s0)\n  mv %s, t0" 
+                      stack_offset (reg_map var_offsets frame_size rd)
+                | _ -> 
+                    Printf.sprintf "  mv %s, %s" 
+                      (reg_map var_offsets frame_size rd) 
+                      (reg_map var_offsets frame_size rs))
             | BinaryOp (op, rd, rs1, rs2) ->
-                let (pre1, rs1_reg) = handle_reg rs1 in
-                let (pre2, rs2_reg) = handle_reg rs2 in
-                let (pre3, rd_reg) = handle_reg rd in
-                let post = handle_store_reg rd rd_reg in
-                (pre1 @ pre2 @ pre3, post, [Printf.sprintf "  %s %s, %s, %s" op rd_reg rs1_reg rs2_reg])
-                
+                (match (rd, rs1, rs2) with
+                | (Temp n, _, _) when n >= 15 -> 
+                    let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                    let src1 = reg_map var_offsets frame_size rs1 in
+                    let src2 = reg_map var_offsets frame_size rs2 in
+                    let (reg1, load1) = 
+                      match rs1 with
+                      | Temp m when m >= 15 -> 
+                          let offset = -(68 + (m - 15 + 1) * 4) in
+                          ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
+                      | _ -> (src1, "")
+                    in
+                    let (reg2, load2) = 
+                      match rs2 with
+                      | Temp m when m >= 15 -> 
+                          let offset = -(68 + (m - 15 + 1) * 4) in
+                          ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
+                      | _ -> (src2, "")
+                    in
+                    load1 ^ load2 ^ 
+                    Printf.sprintf "  %s t0, %s, %s\n  sw t0, %d(s0)" 
+                      op reg1 reg2 stack_offset
+                | _ ->
+                    let dest = reg_map var_offsets frame_size rd in
+                    let (reg1, load1) = 
+                      match rs1 with
+                      | Temp m when m >= 15 -> 
+                          let offset = -(68 + (m - 15 + 1) * 4) in
+                          ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
+                      | _ -> (reg_map var_offsets frame_size rs1, "")
+                    in
+                    let (reg2, load2) = 
+                      match rs2 with
+                      | Temp m when m >= 15 -> 
+                          let offset = -(68 + (m - 15 + 1) * 4) in
+                          ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
+                      | _ -> (reg_map var_offsets frame_size rs2, "")
+                    in
+                    let dest_reg = 
+                      match rd with
+                      | Temp m when m >= 15 -> "t0"
+                      | _ -> dest
+                    in
+                    load1 ^ load2 ^ 
+                    Printf.sprintf "  %s %s, %s, %s" op dest_reg reg1 reg2 ^
+                    (match rd with
+                      | Temp m when m >= 15 -> 
+                          let stack_offset = -(68 + (m - 15 + 1) * 4) in
+                          Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
+                      | _ -> ""))
             | BinaryOpImm (op, rd, rs, imm) ->
-                let (pre_rs, rs_reg) = handle_reg rs in
-                let (pre_rd, rd_reg) = handle_reg rd in
-                let post = handle_store_reg rd rd_reg in
-                (match op with
-                 | "addi" | "slti" | "xori" ->  (* 这些指令需要立即数 *)
-                     if imm >= -2048 && imm <= 2047 then
-                       (pre_rs @ pre_rd, post, [Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm])
-                     else
-                       let temp_reg = "t0" in
-                       let (upper, lower) = split_large_immediate imm in
-                       (pre_rs @ pre_rd, post, [
-                         Printf.sprintf "  lui %s, %d" temp_reg upper;
-                         Printf.sprintf "  addi %s, %s, %d" temp_reg temp_reg lower;
-                         Printf.sprintf "  add %s, %s, %s" rd_reg rs_reg temp_reg
-                       ])
-                 | _ -> 
-                     (pre_rs @ pre_rd, post, [Printf.sprintf "  %s %s, %s, %d" op rd_reg rs_reg imm]))
-                     
+                (match (rd, rs) with
+                | (Temp n, _) when n >= 15 -> 
+                    let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                    let src = reg_map var_offsets frame_size rs in
+                    let (reg, load) = 
+                      match rs with
+                      | Temp m when m >= 15 -> 
+                          let offset = -(68 + (m - 15 + 1) * 4) in
+                          ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
+                      | _ -> (src, "")
+                    in
+                    load ^ 
+                    Printf.sprintf "  %s t0, %s, %d\n  sw t0, %d(s0)" 
+                      op reg imm stack_offset
+                | _ ->
+                    let dest = reg_map var_offsets frame_size rd in
+                    let (reg, load) = 
+                      match rs with
+                      | Temp m when m >= 15 -> 
+                          let offset = -(68 + (m - 15 + 1) * 4) in
+                          ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
+                      | _ -> (reg_map var_offsets frame_size rs, "")
+                    in
+                    let dest_reg = 
+                      match rd with
+                      | Temp m when m >= 15 -> "t0"
+                      | _ -> dest
+                    in
+                    load ^ 
+                    Printf.sprintf "  %s %s, %s, %d" op dest_reg reg imm ^
+                    (match rd with
+                      | Temp m when m >= 15 -> 
+                          let stack_offset = -(68 + (m - 15 + 1) * 4) in
+                          Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
+                      | _ -> ""))
             | Branch (cond, rs1, rs2, label) ->
-                let (pre1, rs1_reg) = handle_reg rs1 in
-                let (pre2, rs2_reg) = handle_reg rs2 in
+                let (reg1, load1) = 
+                  match rs1 with
+                  | Temp m when m >= 15 -> 
+                      let offset = -(68 + (m - 15 + 1) * 4) in
+                      ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
+                  | _ -> (reg_map var_offsets frame_size rs1, "")
+                in
+                let (reg2, load2) = 
+                  match rs2 with
+                  | Temp m when m >= 15 -> 
+                      let offset = -(68 + (m - 15 + 1) * 4) in
+                      ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
+                  | _ -> (reg_map var_offsets frame_size rs2, "")
+                in
+                load1 ^ load2 ^
                 (match cond with
-                 | "beqz" -> (pre1 @ pre2, [], [Printf.sprintf "  beq %s, x0, %s" rs1_reg label])
-                 | "bnez" -> (pre1 @ pre2, [], [Printf.sprintf "  bne %s, x0, %s" rs1_reg label])
-                 | _ -> (pre1 @ pre2, [], [Printf.sprintf "  %s %s, %s, %s" cond rs1_reg rs2_reg label]))
-                 
-            | Jmp label -> 
-                ([], [], [Printf.sprintf "  j %s" label])
-                
-            | Label label -> 
-                ([], [], [Printf.sprintf "%s:" label])
-                
-            | Call func -> 
-                ([], [], [Printf.sprintf "  jal ra, %s" func])
-                
-            | Ret -> 
-                ([], [], ["  jalr x0, ra, 0"])
-                
+                | "beqz" -> Printf.sprintf "  beq %s, x0, %s" reg1 label
+                | "bnez" -> Printf.sprintf "  bne %s, x0, %s" reg1 label
+                | _ -> Printf.sprintf "  %s %s, %s, %s" cond reg1 reg2 label)
             | Store (rs, base, offset) ->
-                let (pre_rs, rs_reg) = handle_reg rs in
-                let (pre_base, base_reg) = handle_reg base in
-                if offset >= -2048 && offset <= 2047 then
-                  (pre_rs @ pre_base, [], [Printf.sprintf "  sw %s, %d(%s)" rs_reg offset base_reg])
-                else
-                  let (upper, lower) = split_large_immediate offset in
-                  let code = [
-                    Printf.sprintf "  lui t0, %d" upper;
-                    Printf.sprintf "  addi t0, t0, %d" lower;
-                    Printf.sprintf "  add t0, t0, %s" base_reg;
-                    Printf.sprintf "  sw %s, 0(t0)" rs_reg
-                  ] in
-                  (pre_rs @ pre_base, [], code)
-                
+                let (reg, load) = 
+                  match rs with
+                  | Temp m when m >= 15 -> 
+                      let stack_offset = -(68 + (m - 15 + 1) * 4) in
+                      ("t0", Printf.sprintf "  lw t0, %d(s0)\n" stack_offset)
+                  | _ -> (reg_map var_offsets frame_size rs, "")
+                in
+                load ^ Printf.sprintf "  sw %s, %d(%s)" 
+                  reg offset (reg_map var_offsets frame_size base)
             | Load (rd, base, offset) ->
-                let (pre_base, base_reg) = handle_reg base in
-                let (pre_rd, rd_reg) = handle_reg rd in
-                let post = handle_store_reg rd rd_reg in
-                if offset >= -2048 && offset <= 2047 then
-                  (pre_base @ pre_rd, post, [Printf.sprintf "  lw %s, %d(%s)" rd_reg offset base_reg])
-                else
-                  let (upper, lower) = split_large_immediate offset in
-                  let code = [
-                    Printf.sprintf "  lui t0, %d" upper;
-                    Printf.sprintf "  addi t0, t0, %d" lower;
-                    Printf.sprintf "  add t0, t0, %s" base_reg;
-                    Printf.sprintf "  lw %s, 0(t0)" rd_reg
-                  ] in
-                  (pre_base @ pre_rd, post, code)
-                
-            | ReloadVar (rd, var_name) ->
-                try
+                (match rd with
+                | Temp n when n >= 15 -> 
+                    let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                    Printf.sprintf "  lw t0, %d(%s)\n  sw t0, %d(s0)" 
+                      offset (reg_map var_offsets frame_size base) stack_offset
+                | _ -> 
+                    Printf.sprintf "  lw %s, %d(%s)" 
+                      (reg_map var_offsets frame_size rd) 
+                      offset (reg_map var_offsets frame_size base))
+            | ReloadVar (reg, var_name) ->
+                (try
                   let offset = Hashtbl.find var_offsets var_name in
-                  let (pre_rd, rd_reg) = handle_reg rd in
-                  let post = handle_store_reg rd rd_reg in
-                  if offset >= -2048 && offset <= 2047 then
-                    (pre_rd, post, [Printf.sprintf "  lw %s, %d(s0)" rd_reg offset])
-                  else
-                    let (upper, lower) = split_large_immediate offset in
-                    let code = [
-                      Printf.sprintf "  lui t0, %d" upper;
-                      Printf.sprintf "  addi t0, t0, %d" lower;
-                      Printf.sprintf "  add t0, t0, s0";
-                      Printf.sprintf "  lw %s, 0(t0)" rd_reg
-                    ] in
-                    (pre_rd, post, code)
+                  (match reg with
+                  | Temp n when n >= 15 -> 
+                      let temp_offset = -(68 + (n - 15 + 1) * 4) in
+                      Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" offset temp_offset
+                  | _ -> 
+                      Printf.sprintf "  lw %s, %d(s0)" 
+                        (reg_map var_offsets frame_size reg) offset)
                 with Not_found ->
-                  failwith ("Variable " ^ var_name ^ " not found during code generation")
+                  failwith ("Variable " ^ var_name ^ " not found during code generation"))
+            | Call func -> 
+                let live_regs = LivenessAnalysis.get_live_regs liveness_info acc_index in
+                let caller_saved = ["t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6"; 
+                                   "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7"] in
+                
+                let regs_to_save = 
+                  LivenessAnalysis.RegSet.fold (fun reg acc ->
+                    match reg with
+                    | Temp n -> 
+                        let reg_name = 
+                          if n < 7 then Printf.sprintf "t%d" n
+                          else if n < 15 then Printf.sprintf "a%d" (n - 7)
+                          else ""
+                        in
+                        if List.mem reg_name caller_saved && reg_name <> "" then
+                          (reg_name, n) :: acc
+                        else
+                          acc
+                    | RiscvReg name ->
+                        if List.mem name caller_saved then
+                          (name, -1) :: acc
+                        else
+                          acc
+                  ) live_regs []
+                in
+                
+                let save_code = 
+                  List.mapi (fun i (reg_name, _) ->
+                    Printf.sprintf "  sw %s, -%d(s0)" reg_name (12 + i * 4)
+                  ) regs_to_save
+                in
+                
+                let call_code = "  call " ^ func in
+                
+                let restore_code = 
+                  List.mapi (fun i (reg_name, _) ->
+                    Printf.sprintf "  lw %s, -%d(s0)" reg_name (12 + i * 4)
+                  ) regs_to_save
+                in
+                
+                String.concat "\n" (save_code @ [call_code] @ restore_code)
+            | Jmp label -> "  j " ^ label
+            | Label label -> label ^ ":"
+            | Ret ->
+                let ra_offset = frame_size - 4 in      
+                let s0_offset = frame_size - 8 in      
+                Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
+                Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
+                Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
+                "  jr ra"
           in
-          
-          let full_code = pre_code @ asm_lines @ post_code in
-          convert_instrs (acc_index + 1) ((List.rev full_code) @ acc_code) rest
+          convert_instrs (acc_index + 1) (acc_code ^ code ^ "\n") rest
     in
-    convert_instrs 0 [] instrs
+    convert_instrs 0 "" instrs
+        
+  let calculate_frame_size (ir_func : ir_func) =
+    let base_size = 108 in
+    
+    let extra_param_space = 
+      if List.length ir_func.params > 8 then
+        (List.length ir_func.params - 8) * 4
+      else 0 
+    in
 
-  (* 生成保存被调用者保存寄存器的指令列表（每条指令单独一项） *)
-  let save_callee_saved frame_size =
-    let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
-    List.flatten (List.mapi (fun i reg ->
-      let offset = frame_size - 12 - i * 4 in  (* 从frame_size-12开始，保存s1到s11 *)
-      if offset >= -2048 && offset <= 2047 then
-        [Printf.sprintf "  sw %s, %d(sp)" reg offset]
-      else
-        let (upper, lower) = split_large_immediate offset in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add t0, t0, sp";
-          Printf.sprintf "  sw %s, 0(t0)" reg
-        ]
-    ) s_regs)
+    let call_stack_space = ref 0 in
+    let analyze_call_stack instr = 
+      match instr with
+      | Store (_, RiscvReg "sp", offset) when offset >= 0 ->
+          call_stack_space := max !call_stack_space (offset + 4)
+      | _ -> ()
+    in
+    List.iter analyze_call_stack ir_func.body;
 
-  (* 生成恢复被调用者保存寄存器的指令列表（每条指令单独一项） *)
-  let restore_callee_saved frame_size =
-    let s_regs = ["s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11"] in
-    List.flatten (List.mapi (fun i reg ->
-      let offset = frame_size - 12 - i * 4 in
-      if offset >= -2048 && offset <= 2047 then
-        [Printf.sprintf "  lw %s, %d(sp)" reg offset]
-      else
-        let (upper, lower) = split_large_immediate offset in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add t0, t0, sp";
-          Printf.sprintf "  lw %s, 0(t0)" reg
-        ]
-    ) s_regs)
+    let used_offsets = ref [] in
+    
+    List.iteri (fun i _ ->
+      if i < 8 then used_offsets := -(68 + i * 4) :: !used_offsets
+    ) ir_func.params;
+    
+    List.iteri (fun i _ ->
+      if i >= 8 then used_offsets := -(68 + i * 4) :: !used_offsets
+    ) ir_func.params;
+
+    let max_temp = ref (-1) in
+    let min_offset = ref 0 in
+
+    let analyze_instr = function
+      | Store (_, RiscvReg "s0", offset) when offset < 0 ->
+          used_offsets := offset :: !used_offsets;
+          if offset < !min_offset then min_offset := offset
+      | Load (Temp n, RiscvReg "s0", offset) when offset < 0 ->
+          used_offsets := offset :: !used_offsets;
+          if offset < !min_offset then min_offset := offset;
+          max_temp := max !max_temp n
+      | Li (Temp n, _) | Mv (Temp n, _) | BinaryOp (_, Temp n, _, _)
+      | BinaryOpImm (_, Temp n, _, _) | ReloadVar (Temp n, _) ->
+          max_temp := max !max_temp n
+      | _ -> ()
+    in
+    List.iter analyze_instr ir_func.body;
+
+    let local_var_size = 
+      if !used_offsets <> [] then -(!min_offset) else 0 in
+
+    let temp_stack_size = 
+      if !max_temp >= 15 then (!max_temp - 14) * 4 else 0 in
+
+    let required_space = base_size + local_var_size + temp_stack_size + extra_param_space + !call_stack_space in
+    let aligned_size = ((required_space + 15) / 16) * 16 in
+    max aligned_size 32
 
   let function_prologue name frame_size =
-    let ra_offset = frame_size - 4 in  (* 返回地址保存在栈帧顶部-4处 *)
-    let s0_offset = frame_size - 8 in  (* 保存s0寄存器 *)
-    let save_code = save_callee_saved frame_size in
-    
-    (* 生成调整栈指针的指令（处理大frame_size） *)
-    let sp_adjust = 
-      if frame_size <= 2047 then
-        [Printf.sprintf "  addi sp, sp, -%d" frame_size]
-      else
-        let n = -frame_size in  (* 需要减去的栈大小，转为负数 *)
-        let (upper, lower) = split_large_immediate n in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          "  add sp, sp, t0"  (* 用add组合高位和低位，避免直接用addi *)
-        ]
-    in
-    
-    let ra_save =
-      if ra_offset >= -2048 && ra_offset <= 2047 then
-        [Printf.sprintf "  sw ra, %d(sp)" ra_offset]
-      else
-        let (upper, lower) = split_large_immediate ra_offset in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add t0, t0, sp";
-          Printf.sprintf "  sw ra, 0(t0)"
-        ]
-    in
-    
-    let s0_save =
-      if s0_offset >= -2048 && s0_offset <= 2047 then
-        [Printf.sprintf "  sw s0, %d(sp)" s0_offset]
-      else
-        let (upper, lower) = split_large_immediate s0_offset in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add t0, t0, sp";
-          Printf.sprintf "  sw s0, 0(t0)"
-        ]
-    in
-    
-    let s0_init =
-      (* s0作为栈帧基地址，指向sp + frame_size *)
-      if frame_size >= -2048 && frame_size <= 2047 then
-        [Printf.sprintf "  addi s0, sp, %d" frame_size]
-      else
-        let (upper, lower) = split_large_immediate frame_size in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add s0, sp, t0"
-        ]
-    in
-    
-    (* 组合所有指令，确保每条指令单独一项 *)
-    (Printf.sprintf "%s:" name) :: 
-    (sp_adjust @ ra_save @ s0_save @ save_code @ s0_init)
+    let ra_offset = frame_size - 4 in
+    let s0_offset = frame_size - 8 in
+    Printf.sprintf "%s:\n" name ^
+    Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
+    Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
+    Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
+    Printf.sprintf "  addi s0, sp, %d\n" frame_size
 
   let function_epilogue frame_size =
     let ra_offset = frame_size - 4 in 
     let s0_offset = frame_size - 8 in 
-    let restore_code = restore_callee_saved frame_size in
-    
-    let ra_restore =
-      if ra_offset >= -2048 && ra_offset <= 2047 then
-        [Printf.sprintf "  lw ra, %d(sp)" ra_offset]
-      else
-        let (upper, lower) = split_large_immediate ra_offset in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add t0, t0, sp";
-          Printf.sprintf "  lw ra, 0(t0)"
-        ]
-    in
-    
-    let s0_restore =
-      if s0_offset >= -2048 && s0_offset <= 2047 then
-        [Printf.sprintf "  lw s0, %d(sp)" s0_offset]
-      else
-        let (upper, lower) = split_large_immediate s0_offset in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          Printf.sprintf "  add t0, t0, sp";
-          Printf.sprintf "  lw s0, 0(t0)"
-        ]
-    in
-    
-    let sp_restore =
-      if frame_size <= 2047 then
-        [Printf.sprintf "  addi sp, sp, %d" frame_size]
-      else
-        let (upper, lower) = split_large_immediate frame_size in
-        [
-          Printf.sprintf "  lui t0, %d" upper;
-          Printf.sprintf "  addi t0, t0, %d" lower;
-          "  add sp, sp, t0"
-        ]
-    in
-    
-    (* 组合所有指令，确保每条指令单独一项 *)
-    restore_code @ ra_restore @ s0_restore @ sp_restore @ ["  jalr x0, ra, 0"]
+    Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
+    Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
+    Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
+    "  jr ra\n"
 
   let func_to_asm var_offsets (ir_func : ir_func) =
+    let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
-    let prologue = function_prologue ir_func.name frame_size in
     
-    (* 处理参数的指令列表 *)
-    let param_code = List.flatten (List.mapi (fun i param ->
-      let offset = -4 * (i + 1) in  (* 参数偏移：-4, -8, -12... *)
-      if i < 8 then (
-        if offset >= -2048 && offset <= 2047 then
-          [Printf.sprintf "  sw a%d, %d(s0)" i offset]
-        else
-          let (upper, lower) = split_large_immediate offset in
-          [
-            Printf.sprintf "  lui t0, %d" upper;
-            Printf.sprintf "  addi t0, t0, %d" lower;
-            Printf.sprintf "  add t0, t0, s0";
-            Printf.sprintf "  sw a%d, 0(t0)" i
-          ]
-      ) else
-        let param_stack_offset = (i - 8) * 4 in
-        let load_param =
-          if param_stack_offset >= -2048 && param_stack_offset <= 2047 then
-            [Printf.sprintf "  lw t0, %d(s0)" param_stack_offset]
-          else
-            let (upper, lower) = split_large_immediate param_stack_offset in
-            [
-              Printf.sprintf "  lui t0, %d" upper;
-              Printf.sprintf "  addi t0, t0, %d" lower;
-              Printf.sprintf "  add t0, t0, s0";
-              Printf.sprintf "  lw t0, 0(t0)"
-            ]
-        in
-        let store_param =
-          if offset >= -2048 && offset <= 2047 then
-            [Printf.sprintf "  sw t0, %d(s0)" offset]
-          else
-            let (upper, lower) = split_large_immediate offset in
-            [
-              Printf.sprintf "  lui t1, %d" upper;
-              Printf.sprintf "  addi t1, t1, %d" lower;
-              Printf.sprintf "  add t1, t1, s0";
-              Printf.sprintf "  sw t0, 0(t1)"
-            ]
-        in
-        load_param @ store_param
-    ) ir_func.params) in
-    
-    let body_code = instr_to_asm var_offsets frame_size ir_func.body in
-    
-    let epilogue = 
-      if not (List.exists (function Ret -> true | _ -> false) ir_func.body) then
-        function_epilogue frame_size
+    Buffer.add_string buf (function_prologue ir_func.name frame_size);
+      
+    List.iteri (fun i param ->
+      let offset = -(68 + i * 4) in
+      if i < 8 then
+        Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
       else
-        []
-    in
+         let param_stack_offset = (i - 8) * 4 in
+         Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)\n" param_stack_offset offset)
+    ) ir_func.params;
     
-    (* 组合所有指令并转换为字符串，每条指令占一行 *)
-    String.concat "\n" (prologue @ param_code @ body_code @ epilogue)
+    let asm_code = instr_to_asm var_offsets frame_size ir_func.body in
+    Buffer.add_string buf asm_code;
+    
+    let has_explicit_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
+    
+    if not has_explicit_return then (
+      Buffer.add_string buf (function_epilogue frame_size);
+    );
+    
+    Buffer.contents buf
 end
 
-(* ==================== 主程序：生成标准RISC-V汇编 ==================== *)
 let () =
   let ast = parse_channel stdin in
   semantic_analysis ast;
   
   let ir_with_offsets = List.map func_to_ir ast in
+  
   let (ir_funcs, var_offsets_list) = List.split ir_with_offsets in
   
   let combined_var_offsets = Hashtbl.create 50 in
-  List.iter (fun vo -> Hashtbl.iter (fun k v -> Hashtbl.add combined_var_offsets k v) vo) var_offsets_list;
+  List.iter (fun var_offsets ->
+    Hashtbl.iter (fun name offset ->
+      Hashtbl.add combined_var_offsets name offset
+    ) var_offsets
+  ) var_offsets_list;
+  
+  let riscv_asm = List.map (IRToRiscV.func_to_asm combined_var_offsets) ir_funcs in
   
   Printf.printf ".global main\n";
-  List.iter (fun func -> 
-    let asm = IRToRiscV.func_to_asm combined_var_offsets func in
-    Printf.printf "%s\n" asm
-  ) ir_funcs;
+  List.iter (fun f -> 
+    Printf.printf "%s\n" f
+  ) riscv_asm;
   
-  prerr_endline "Compilation successful! Output is standard RISC-V 32-bit assembly (no pseudoinstructions).";
+  prerr_endline "Compilation successful!";
